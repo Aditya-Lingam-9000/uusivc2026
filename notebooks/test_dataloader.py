@@ -2,127 +2,134 @@
 notebooks/test_dataloader.py
 Run this on Kaggle (CPU session) to verify all 5 task loaders work.
 
-HOW TO RUN ON KAGGLE:
-  # Cell 1 — Setup
+HOW TO RUN:
+  # In notebook cell:
   TRAIN_PATH = "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN"
-  !git clone https://github.com/YOUR_USERNAME/uusivc2026 repo
-  import sys; sys.path.insert(0, 'repo')
-  !cp repo/notebooks/test_dataloader.py .
-
-  # Cell 2 — Run
-  exec(open('test_dataloader.py').read())
-
-WHAT TO OBSERVE:
-  - Each task prints: Dataset size + first 2 sample shapes
-  - All 5 tasks should print "PASSED"
-  - No KeyError, FileNotFoundError, or shape errors
+  VAL_PATH   = "/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL"
+  exec(open('/kaggle/working/repo/notebooks/test_dataloader.py').read())
 """
 
-import sys
-import os
-import torch
-import numpy as np
-import argparse
+import sys, os, argparse, traceback
+import torch, numpy as np
 
-# ── Path setup ────────────────────────────────────────────────
-def get_train_path():
-    train_path = globals().get('TRAIN_PATH', None)
-    if train_path:
-        return train_path
-    has_args = any(a.startswith('--train') for a in sys.argv)
-    if has_args:
-        p = argparse.ArgumentParser()
-        p.add_argument('--train', type=str)
-        args, _ = p.parse_known_args()
-        return args.train
-    return "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN"
+# ── Path resolution ───────────────────────────────────────────
+def _get(env_key, default):
+    v = globals().get(env_key)
+    return v if v else default
 
-TRAIN = get_train_path()
-print(f"Using TRAIN: {TRAIN}")
+TRAIN = _get("TRAIN_PATH", "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN")
+VAL   = _get("VAL_PATH",   "/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL")
+print(f"TRAIN : {TRAIN}")
+print(f"VAL   : {VAL}")
 
-# ── Imports (assumes repo is on sys.path) ──────────────────────
+# ── Import src ────────────────────────────────────────────────
 try:
     from src.dataset import UUSIVCDataset
-    from src.transforms import get_val_transforms, SegValTransform
+    from src.transforms import get_val_transforms
     print("✅ Imports OK")
 except ImportError as e:
     print(f"❌ Import failed: {e}")
-    print("Make sure sys.path includes the repo root.")
     raise
 
-# ── Ground truth JSON paths ────────────────────────────────────
+# ── Verify JSON files exist ───────────────────────────────────
 PRIVATE_GT = f"{TRAIN}/dataset_json_fingerprints_v4/private_train_ground_truth.json"
 PUBLIC_GT  = f"{TRAIN}/dataset_json_fingerprints_v4/public_all_ground_truth.json"
+VAL_GT     = f"{VAL}/dataset_json_fingerprints_v4/private_val_for_participants.json"
 
-for p in [PRIVATE_GT, PUBLIC_GT]:
-    if not os.path.exists(p):
-        print(f"❌ JSON not found: {p}")
-        raise FileNotFoundError(p)
-    print(f"✅ Found: {os.path.basename(p)}")
+for p in [PRIVATE_GT, PUBLIC_GT, VAL_GT]:
+    status = "✅" if os.path.exists(p) else "❌"
+    print(f"{status} {os.path.basename(p)}")
 
-# ── Test each task ─────────────────────────────────────────────
-tasks = ['image_cls', 'image_seg', 'ceus_cls', 'ceus_seg', 'video_seg']
+# ── Test each task (TRAIN samples) ───────────────────────────
+tasks = ["image_cls", "image_seg", "ceus_cls", "ceus_seg", "video_seg"]
 results = {}
 
 for task in tasks:
     print(f"\n{'='*55}")
-    print(f"  TESTING: {task}")
+    print(f"  TESTING TRAIN: {task}")
     print(f"{'='*55}")
     try:
-        # Select transform based on task type
-        if task in ['image_cls', 'image_seg']:
-            transform = get_val_transforms()
-        else:
-            transform = None  # NPY tasks normalize inside dataset
+        transform = get_val_transforms() if task in ["image_cls", "image_seg"] else None
 
         ds = UUSIVCDataset(
             json_paths=[PRIVATE_GT, PUBLIC_GT],
             data_root=TRAIN,
+            val_root=VAL,
             transform=transform,
             task_filter=[task],
-            max_samples=5,    # Only load 5 samples for testing
+            max_samples=3,
         )
+        print(f"  Dataset size: {len(ds)}")
 
-        print(f"  Dataset size (capped at 5): {len(ds)}")
-
-        # Load and inspect 2 samples
         for i in range(min(2, len(ds))):
             sample = ds[i]
-            print(f"\n  Sample [{i}]:")
-            print(f"    sample_id : {sample['sample_id'][:50]}...")
-            print(f"    task      : {sample['task']}")
-            print(f"    organ     : {sample['organ']}")
+            print(f"\n  Sample [{i}]  organ={sample['organ']}")
             for k, v in sample.items():
-                if k in ('sample_id', 'task', 'organ'):
+                if k in ("sample_id", "task", "organ", "extra"):
                     continue
                 if isinstance(v, torch.Tensor):
-                    print(f"    {k:12s}: Tensor shape={v.shape} dtype={v.dtype} "
+                    print(f"    {k:12s}: shape={list(v.shape)} dtype={v.dtype} "
                           f"min={v.min():.3f} max={v.max():.3f}")
                 elif isinstance(v, dict):
-                    print(f"    {k:12s}: dict with {len(v)} keys: {list(v.keys())[:3]}")
+                    print(f"    {k:12s}: dict keys={list(v.keys())[:4]}")
                 elif v is None:
-                    print(f"    {k:12s}: None")
+                    print(f"    {k:12s}: None (expected for val/unlabelled)")
                 else:
                     print(f"    {k:12s}: {v}")
 
-        results[task] = 'PASSED ✅'
-        print(f"\n  >>> {task}: PASSED ✅")
+        results[task] = "PASSED ✅"
+        print(f"\n  >>> {task} TRAIN: PASSED ✅")
 
     except Exception as e:
-        import traceback
-        results[task] = f'FAILED ❌ — {e}'
-        print(f"\n  >>> {task}: FAILED ❌")
+        results[task] = f"FAILED ❌ — {e}"
+        print(f"\n  >>> {task} TRAIN: FAILED ❌  —  {e}")
+        traceback.print_exc()
+
+# ── Test VAL inference path ───────────────────────────────────
+print(f"\n{'='*55}")
+print("  TESTING VAL (inference, no labels)")
+print(f"{'='*55}")
+val_results = {}
+for task in tasks:
+    try:
+        transform = get_val_transforms() if task in ["image_cls", "image_seg"] else None
+        ds = UUSIVCDataset(
+            json_paths=[VAL_GT],
+            data_root=TRAIN,
+            val_root=VAL,
+            transform=transform,
+            task_filter=[task],
+            max_samples=2,
+        )
+        if len(ds) == 0:
+            val_results[task] = "SKIPPED (0 samples in val)"
+            continue
+        sample = ds[0]
+        val_results[task] = "PASSED ✅"
+        # Confirm label is -1 (no ground truth)
+        if "label" in sample:
+            assert sample["label"].item() == -1, "Expected -1 label for val sample"
+        if "mask" in sample:
+            assert sample["mask"] is None, "Expected None mask for val sample"
+        print(f"  {task:15s}: PASSED ✅  (label=-1 / mask=None confirmed)")
+    except Exception as e:
+        val_results[task] = f"FAILED ❌ — {e}"
+        print(f"  {task:15s}: FAILED ❌ — {e}")
         traceback.print_exc()
 
 # ── Final summary ──────────────────────────────────────────────
 print(f"\n{'='*55}")
-print("  FINAL RESULTS")
-print(f"{'='*55}")
-for task, result in results.items():
-    print(f"  {task:15s}: {result}")
+print("  FINAL RESULTS — TRAIN")
+for task, r in results.items():
+    print(f"  {task:15s}: {r}")
+print(f"\n  FINAL RESULTS — VAL")
+for task, r in val_results.items():
+    print(f"  {task:15s}: {r}")
 
-all_passed = all('PASSED' in r for r in results.values())
-if all_passed:
-    print("\n🎉 ALL TASKS PASSED — DataLoader is ready!")
+all_train = all("PASSED" in r for r in results.values())
+all_val   = all("PASSED" in r or "SKIPPED" in r for r in val_results.values())
+
+if all_train and all_val:
+    print("\n🎉 ALL CHECKS PASSED — DataLoader is ready for model training!")
 else:
-    print("\n⚠️  Some tasks failed — fix before proceeding to model training.")
+    print("\n⚠️  Some checks failed — fix dataset.py before proceeding.")
