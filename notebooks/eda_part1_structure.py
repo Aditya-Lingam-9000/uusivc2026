@@ -18,8 +18,35 @@ from collections import defaultdict, Counter
 import warnings
 warnings.filterwarnings('ignore')
 
-TRAIN = "/kaggle/input/uusivc-train-zip/TRAIN"
-VAL   = "/kaggle/input/uusivc-val-zip/VAL"
+# ── Dynamic Directory Detection ──────────────────────────────
+def find_dataset_dirs():
+    train_dir = None
+    val_dir = None
+    
+    # Scan /kaggle/input recursively for directories named TRAIN and VAL (case insensitive)
+    for root, dirs, files in os.walk("/kaggle/input"):
+        for d in dirs:
+            if d.upper() == "TRAIN":
+                train_dir = os.path.join(root, d)
+            elif d.upper() == "VAL":
+                val_dir = os.path.join(root, d)
+                
+    # If not found, let's print what is in /kaggle/input and try to fallback to the first folder
+    if not train_dir or not val_dir:
+        print("WARNING: Could not automatically detect TRAIN or VAL folders in /kaggle/input.")
+        print("Contents of /kaggle/input:")
+        for p in glob.glob("/kaggle/input/**/*", recursive=True):
+            print(f"  {p}")
+            if "TRAIN" in p.upper() and os.path.isdir(p) and not train_dir:
+                train_dir = p
+            if "VAL" in p.upper() and os.path.isdir(p) and not val_dir:
+                val_dir = p
+                
+    print(f"Detected TRAIN path: {train_dir}")
+    print(f"Detected VAL path:   {val_dir}")
+    return train_dir, val_dir
+
+TRAIN, VAL = find_dataset_dirs()
 OUT   = "/kaggle/working/eda_outputs"
 os.makedirs(OUT, exist_ok=True)
 
@@ -30,6 +57,8 @@ def save(fig, name):
     print(f"  ✓ saved {name}.png")
 
 def find(base, ext):
+    if not base or not os.path.exists(base):
+        return []
     return sorted(glob.glob(f"{base}/**/*{ext}", recursive=True))
 
 # ============================================================
@@ -160,23 +189,26 @@ for key, fpath in sorted(img_samples.items()):
 
 # ── Figure 1: grid of sample images ──────────────────────────
 n = len(img_samples)
-cols = 5
-rows = (n + cols - 1) // cols
-fig, axes = plt.subplots(rows, cols, figsize=(cols*3, rows*3))
-axes = np.array(axes).flatten()
-for ax in axes: ax.axis('off')
+if n > 0:
+    cols = 5
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(cols*3, rows*3))
+    axes = np.array(axes).flatten()
+    for ax in axes: ax.axis('off')
 
-for i, (key, fpath) in enumerate(sorted(img_samples.items())):
-    try:
-        img = np.array(Image.open(fpath).convert('RGB'))
-        axes[i].imshow(img, cmap='gray' if img.ndim==2 else None)
-        label = key.split('/')[-2] + '/' + key.split('/')[-1]
-        axes[i].set_title(label, fontsize=7)
-    except: pass
+    for i, (key, fpath) in enumerate(sorted(img_samples.items())):
+        try:
+            img = np.array(Image.open(fpath).convert('RGB'))
+            axes[i].imshow(img, cmap='gray' if img.ndim==2 else None)
+            label = key.split('/')[-2] + '/' + key.split('/')[-1]
+            axes[i].set_title(label, fontsize=7)
+        except: pass
 
-fig.suptitle("Sample Images — All Organs/Tasks (Train + Val)", fontsize=12, fontweight='bold')
-plt.tight_layout()
-save(fig, "01_image_samples_grid")
+    fig.suptitle("Sample Images — All Organs/Tasks (Train + Val)", fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    save(fig, "01_image_samples_grid")
+else:
+    print("Warning: No image samples found, skipping 01_image_samples_grid.png")
 
 # ── Figure 2: resolution scatter ─────────────────────────────
 if stats:
@@ -231,20 +263,23 @@ for key, mpath in sorted(mask_samples.items()):
         pairs.append((organ, img_candidates[0], mpath))
 
 n = len(pairs)
-fig, axes = plt.subplots(n, 2, figsize=(8, n*3))
-if n == 1: axes = axes.reshape(1, 2)
-for i, (organ, ipath, mpath) in enumerate(pairs):
-    try:
-        img  = np.array(Image.open(ipath).convert('L'))
-        mask = np.array(Image.open(mpath))
-        axes[i,0].imshow(img, cmap='gray'); axes[i,0].set_title(f"{organ} — Image", fontsize=9)
-        axes[i,1].imshow(mask, cmap='jet');  axes[i,1].set_title(f"{organ} — Mask (vals={np.unique(mask)})", fontsize=9)
-        for ax in axes[i]: ax.axis('off')
-    except Exception as e:
-        axes[i,0].set_title(f"ERROR: {e}")
-fig.suptitle("Image + Mask Pairs — image_seg (Private Train)", fontsize=12, fontweight='bold')
-plt.tight_layout()
-save(fig, "03_image_mask_pairs")
+if n > 0:
+    fig, axes = plt.subplots(n, 2, figsize=(8, n*3))
+    if n == 1: axes = axes.reshape(1, 2)
+    for i, (organ, ipath, mpath) in enumerate(pairs):
+        try:
+            img  = np.array(Image.open(ipath).convert('L'))
+            mask = np.array(Image.open(mpath))
+            axes[i,0].imshow(img, cmap='gray'); axes[i,0].set_title(f"{organ} — Image", fontsize=9)
+            axes[i,1].imshow(mask, cmap='jet');  axes[i,1].set_title(f"{organ} — Mask (vals={np.unique(mask)})", fontsize=9)
+            for ax in axes[i]: ax.axis('off')
+        except Exception as e:
+            axes[i,0].set_title(f"ERROR: {e}")
+    fig.suptitle("Image + Mask Pairs — image_seg (Private Train)", fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    save(fig, "03_image_mask_pairs")
+else:
+    print("Warning: No image_seg mask pairs found, skipping 03_image_mask_pairs.png")
 
 print("\n✅ PART 1 COMPLETE — check /kaggle/working/eda_outputs/")
 print(f"   Files: 01_image_samples_grid.png, 02_resolution_scatter.png, 03_image_mask_pairs.png")

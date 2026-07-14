@@ -16,8 +16,35 @@ from PIL import Image
 import warnings
 warnings.filterwarnings('ignore')
 
-TRAIN = "/kaggle/input/uusivc-train-zip/TRAIN"
-VAL   = "/kaggle/input/uusivc-val-zip/VAL"
+# ── Dynamic Directory Detection ──────────────────────────────
+def find_dataset_dirs():
+    train_dir = None
+    val_dir = None
+    
+    # Scan /kaggle/input recursively for directories named TRAIN and VAL (case insensitive)
+    for root, dirs, files in os.walk("/kaggle/input"):
+        for d in dirs:
+            if d.upper() == "TRAIN":
+                train_dir = os.path.join(root, d)
+            elif d.upper() == "VAL":
+                val_dir = os.path.join(root, d)
+                
+    # If not found, let's print what is in /kaggle/input and try to fallback to the first folder
+    if not train_dir or not val_dir:
+        print("WARNING: Could not automatically detect TRAIN or VAL folders in /kaggle/input.")
+        print("Contents of /kaggle/input:")
+        for p in glob.glob("/kaggle/input/**/*", recursive=True):
+            print(f"  {p}")
+            if "TRAIN" in p.upper() and os.path.isdir(p) and not train_dir:
+                train_dir = p
+            if "VAL" in p.upper() and os.path.isdir(p) and not val_dir:
+                val_dir = p
+                
+    print(f"Detected TRAIN path: {train_dir}")
+    print(f"Detected VAL path:   {val_dir}")
+    return train_dir, val_dir
+
+TRAIN, VAL = find_dataset_dirs()
 OUT   = "/kaggle/working/eda_outputs"
 os.makedirs(OUT, exist_ok=True)
 
@@ -27,6 +54,8 @@ def save(fig, name):
     print(f"  ✓ saved {name}.png")
 
 def find(base, ext):
+    if not base or not os.path.exists(base):
+        return []
     return sorted(glob.glob(f"{base}/**/*{ext}", recursive=True))
 
 # ============================================================
@@ -78,50 +107,53 @@ for key, fpath in sorted(npy_samples.items()):
 
 # ── Figure 4: visualise NPY frames ───────────────────────────
 n = len(npy_stats)
-cols = 4
-rows = (n + cols - 1) // cols
-fig, axes = plt.subplots(rows, cols, figsize=(cols*4, rows*4))
-axes = np.array(axes).flatten()
-for ax in axes: ax.axis('off')
+if n > 0:
+    cols = 4
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(cols*4, rows*4))
+    axes = np.array(axes).flatten()
+    for ax in axes: ax.axis('off')
 
-for i, s in enumerate(npy_stats):
-    try:
-        arr = np.load(s['path'])
-        # Normalise for display
-        a = arr.astype(np.float32)
+    for i, s in enumerate(npy_stats):
+        try:
+            arr = np.load(s['path'])
+            # Normalise for display
+            a = arr.astype(np.float32)
 
-        if a.ndim == 2:
-            # single frame grayscale
-            frame = a
-        elif a.ndim == 3:
-            # could be (T, H, W) or (H, W, C)
-            if a.shape[0] < a.shape[1] and a.shape[0] < a.shape[2]:
-                # likely (T, H, W)
-                mid = a.shape[0] // 2
-                frame = a[mid]
+            if a.ndim == 2:
+                # single frame grayscale
+                frame = a
+            elif a.ndim == 3:
+                # could be (T, H, W) or (H, W, C)
+                if a.shape[0] < a.shape[1] and a.shape[0] < a.shape[2]:
+                    # likely (T, H, W)
+                    mid = a.shape[0] // 2
+                    frame = a[mid]
+                else:
+                    # likely (H, W, C)
+                    frame = a[:, :, 0] if a.shape[2] > 1 else a[:, :, 0]
+            elif a.ndim == 4:
+                # (T, H, W, C) or (B, T, H, W)
+                frame = a[a.shape[0]//2, ..., 0] if a.shape[-1] in [1,3] else a[0, a.shape[1]//2]
             else:
-                # likely (H, W, C)
-                frame = a[:, :, 0] if a.shape[2] > 1 else a[:, :, 0]
-        elif a.ndim == 4:
-            # (T, H, W, C) or (B, T, H, W)
-            frame = a[a.shape[0]//2, ..., 0] if a.shape[-1] in [1,3] else a[0, a.shape[1]//2]
-        else:
-            frame = a.reshape(a.shape[-2], a.shape[-1])
+                frame = a.reshape(a.shape[-2], a.shape[-1])
 
-        # clip + normalize to 0-1
-        lo, hi = np.percentile(frame, 1), np.percentile(frame, 99)
-        if hi > lo:
-            frame = np.clip((frame - lo) / (hi - lo), 0, 1)
+            # clip + normalize to 0-1
+            lo, hi = np.percentile(frame, 1), np.percentile(frame, 99)
+            if hi > lo:
+                frame = np.clip((frame - lo) / (hi - lo), 0, 1)
 
-        axes[i].imshow(frame, cmap='gray')
-        title = s['key'].replace('TRAIN/','T/').replace('VAL/','V/')
-        axes[i].set_title(f"{title}\n{s['shape']} {s['dtype']}", fontsize=6)
-    except Exception as e:
-        axes[i].set_title(f"ERR: {e}", fontsize=6)
+            axes[i].imshow(frame, cmap='gray')
+            title = s['key'].replace('TRAIN/','T/').replace('VAL/','V/')
+            axes[i].set_title(f"{title}\n{s['shape']} {s['dtype']}", fontsize=6)
+        except Exception as e:
+            axes[i].set_title(f"ERR: {e}", fontsize=6)
 
-fig.suptitle("NPY File Visualisation — CEUS & Video (mid-frame)", fontsize=12, fontweight='bold')
-plt.tight_layout()
-save(fig, "04_npy_frames")
+    fig.suptitle("NPY File Visualisation — CEUS & Video (mid-frame)", fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    save(fig, "04_npy_frames")
+else:
+    print("Warning: No NPY stats collected, skipping 04_npy_frames.png")
 
 # ============================================================
 # SECTION 6 — NPZ FILES (CEUS + Video Annotations)
@@ -176,40 +208,43 @@ for key, fpath in sorted(npz_samples.items()):
         print(f"  ERROR {key}: {e}")
 
 # ── Figure 5: NPZ mask visualisation ─────────────────────────
-fig, axes = plt.subplots(2, len(npz_samples), figsize=(len(npz_samples)*3, 6))
-if len(npz_samples) == 1:
-    axes = axes.reshape(2, 1)
-axes = np.array(axes)
+if len(npz_samples) > 0:
+    fig, axes = plt.subplots(2, len(npz_samples), figsize=(len(npz_samples)*3, 6))
+    if len(npz_samples) == 1:
+        axes = axes.reshape(2, 1)
+    axes = np.array(axes)
 
-for j, (key, fpath) in enumerate(sorted(npz_samples.items())):
-    try:
-        npz = np.load(fpath, allow_pickle=True)
-        k = list(npz.keys())[0]
-        arr = npz[k]
+    for j, (key, fpath) in enumerate(sorted(npz_samples.items())):
+        try:
+            npz = np.load(fpath, allow_pickle=True)
+            k = list(npz.keys())[0]
+            arr = npz[k]
 
-        if arr.dtype == object:
-            inner = arr.item()
-            if isinstance(inner, dict):
-                frame_keys = list(inner.keys())
-                # show first and middle frame mask
-                for plot_i, fk in enumerate(frame_keys[:2]):
-                    mask = np.array(inner[fk])
-                    axes[plot_i, j].imshow(mask, cmap='jet')
-                    axes[plot_i, j].set_title(f"{key}\nframe={fk}", fontsize=6)
-                    axes[plot_i, j].axis('off')
-        else:
-            # direct 2D mask
-            axes[0, j].imshow(arr if arr.ndim == 2 else arr[0], cmap='jet')
-            axes[0, j].set_title(f"{key}\nshape={arr.shape}", fontsize=6)
-            axes[0, j].axis('off')
+            if arr.dtype == object:
+                inner = arr.item()
+                if isinstance(inner, dict):
+                    frame_keys = list(inner.keys())
+                    # show first and middle frame mask
+                    for plot_i, fk in enumerate(frame_keys[:2]):
+                        mask = np.array(inner[fk])
+                        axes[plot_i, j].imshow(mask, cmap='jet')
+                        axes[plot_i, j].set_title(f"{key}\nframe={fk}", fontsize=6)
+                        axes[plot_i, j].axis('off')
+            else:
+                # direct 2D mask
+                axes[0, j].imshow(arr if arr.ndim == 2 else arr[0], cmap='jet')
+                axes[0, j].set_title(f"{key}\nshape={arr.shape}", fontsize=6)
+                axes[0, j].axis('off')
+                axes[1, j].axis('off')
+        except Exception as e:
+            axes[0, j].set_title(f"ERR: {e}", fontsize=6)
             axes[1, j].axis('off')
-    except Exception as e:
-        axes[0, j].set_title(f"ERR: {e}", fontsize=6)
-        axes[1, j].axis('off')
 
-fig.suptitle("NPZ Annotation Masks — ceus_seg & video_seg", fontsize=12, fontweight='bold')
-plt.tight_layout()
-save(fig, "05_npz_masks")
+    fig.suptitle("NPZ Annotation Masks — ceus_seg & video_seg", fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    save(fig, "05_npz_masks")
+else:
+    print("Warning: No NPZ samples found, skipping 05_npz_masks.png")
 
 # ============================================================
 # SECTION 7 — CLASS DISTRIBUTION (TRAIN)
