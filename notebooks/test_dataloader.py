@@ -9,8 +9,15 @@ HOW TO RUN:
   exec(open('/kaggle/working/repo/notebooks/test_dataloader.py').read())
 """
 
-import sys, os, argparse, traceback
+import sys, os, traceback, importlib
 import torch, numpy as np
+
+# ── Force reload src modules so exec() always uses the latest code on disk ──
+# This avoids the "old cached module" problem when you git pull without restarting kernel.
+for mod_name in list(sys.modules.keys()):
+    if mod_name.startswith("src"):
+        del sys.modules[mod_name]
+        print(f"  [cache cleared] {mod_name}")
 
 # ── Path resolution ───────────────────────────────────────────
 def _get(env_key, default):
