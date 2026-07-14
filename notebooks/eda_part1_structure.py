@@ -18,35 +18,45 @@ from collections import defaultdict, Counter
 import warnings
 warnings.filterwarnings('ignore')
 
-# ── Dynamic Directory Detection ──────────────────────────────
-def find_dataset_dirs():
-    train_dir = None
-    val_dir = None
-    
-    # Scan /kaggle/input recursively for directories named TRAIN and VAL (case insensitive)
-    for root, dirs, files in os.walk("/kaggle/input"):
-        for d in dirs:
-            if d.upper() == "TRAIN":
-                train_dir = os.path.join(root, d)
-            elif d.upper() == "VAL":
-                val_dir = os.path.join(root, d)
-                
-    # If not found, let's print what is in /kaggle/input and try to fallback to the first folder
-    if not train_dir or not val_dir:
-        print("WARNING: Could not automatically detect TRAIN or VAL folders in /kaggle/input.")
-        print("Contents of /kaggle/input:")
-        for p in glob.glob("/kaggle/input/**/*", recursive=True):
-            print(f"  {p}")
-            if "TRAIN" in p.upper() and os.path.isdir(p) and not train_dir:
-                train_dir = p
-            if "VAL" in p.upper() and os.path.isdir(p) and not val_dir:
-                val_dir = p
-                
-    print(f"Detected TRAIN path: {train_dir}")
-    print(f"Detected VAL path:   {val_dir}")
-    return train_dir, val_dir
+import argparse
+import sys
 
-TRAIN, VAL = find_dataset_dirs()
+# ── Parse Paths from CLI or Notebook globals ─────────────────
+def get_paths():
+    # default guesses based on user's actual paths
+    default_train = "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN"
+    default_val = "/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL"
+    
+    # Check if globals exist (useful when running via exec() from a notebook)
+    train_path = globals().get('TRAIN_PATH', None)
+    val_path = globals().get('VAL_PATH', None)
+    
+    if train_path and val_path:
+        print(f"Using TRAIN_PATH and VAL_PATH from notebook globals:")
+        print(f"  TRAIN: {train_path}")
+        print(f"  VAL:   {val_path}")
+        return train_path, val_path
+        
+    # Check if run from command line with CLI arguments
+    has_args = any(arg.startswith('--train') or arg.startswith('--val') for arg in sys.argv)
+    
+    if has_args:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--train", type=str, default=default_train)
+        parser.add_argument("--val", type=str, default=default_val)
+        args, _ = parser.parse_known_args()
+        print(f"Parsed CLI arguments:")
+        print(f"  TRAIN: {args.train}")
+        print(f"  VAL:   {args.val}")
+        return args.train, args.val
+        
+    # Fallback to defaults
+    print(f"Using default paths:")
+    print(f"  TRAIN: {default_train}")
+    print(f"  VAL:   {default_val}")
+    return default_train, default_val
+
+TRAIN, VAL = get_paths()
 OUT   = "/kaggle/working/eda_outputs"
 os.makedirs(OUT, exist_ok=True)
 

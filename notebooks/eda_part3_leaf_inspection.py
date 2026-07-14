@@ -4,16 +4,45 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from pathlib import Path
 
-# Detect paths
-def find_dataset_dirs():
-    train_dir, val_dir = None, None
-    for root, dirs, files in os.walk("/kaggle/input"):
-        for d in dirs:
-            if d.upper() == "TRAIN": train_dir = os.path.join(root, d)
-            elif d.upper() == "VAL": val_dir = os.path.join(root, d)
-    return train_dir, val_dir
+import argparse
+import sys
 
-TRAIN, VAL = find_dataset_dirs()
+# ── Parse Paths from CLI or Notebook globals ─────────────────
+def get_paths():
+    # default guesses based on user's actual paths
+    default_train = "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN"
+    default_val = "/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL"
+    
+    # Check if globals exist (useful when running via exec() from a notebook)
+    train_path = globals().get('TRAIN_PATH', None)
+    val_path = globals().get('VAL_PATH', None)
+    
+    if train_path and val_path:
+        print(f"Using TRAIN_PATH and VAL_PATH from notebook globals:")
+        print(f"  TRAIN: {train_path}")
+        print(f"  VAL:   {val_path}")
+        return train_path, val_path
+        
+    # Check if run from command line with CLI arguments
+    has_args = any(arg.startswith('--train') or arg.startswith('--val') for arg in sys.argv)
+    
+    if has_args:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--train", type=str, default=default_train)
+        parser.add_argument("--val", type=str, default=default_val)
+        args, _ = parser.parse_known_args()
+        print(f"Parsed CLI arguments:")
+        print(f"  TRAIN: {args.train}")
+        print(f"  VAL:   {args.val}")
+        return args.train, args.val
+        
+    # Fallback to defaults
+    print(f"Using default paths:")
+    print(f"  TRAIN: {default_train}")
+    print(f"  VAL:   {default_val}")
+    return default_train, default_val
+
+TRAIN, VAL = get_paths()
 OUT = "/kaggle/working/inspections"
 os.makedirs(OUT, exist_ok=True)
 
