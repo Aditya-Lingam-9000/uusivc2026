@@ -32,7 +32,7 @@ for mod in list(sys.modules.keys()):
 TRAIN   = globals().get("TRAIN_PATH", "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN")
 VAL_DIR = globals().get("VAL_PATH",   "/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL")
 
-IMAGE_SIZE   = 256
+IMAGE_SIZE   = 512
 BATCH_SIZE   = 16        # smaller than cls because masks add memory
 EPOCHS       = 15
 LR           = 1e-4
