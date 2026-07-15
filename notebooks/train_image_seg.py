@@ -163,7 +163,7 @@ model = model.to(DEVICE)
 print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
 
 # ── Loss ──────────────────────────────────────────────────────
-criterion = build_seg_loss(pos_weight=2.0)   # upweight foreground
+criterion = build_seg_loss(pos_weight=2.0).to(DEVICE)   # upweight foreground
 
 # ── Optimizer + Scheduler ─────────────────────────────────────
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
