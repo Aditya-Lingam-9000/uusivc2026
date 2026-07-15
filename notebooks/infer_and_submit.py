@@ -29,7 +29,7 @@ OUTPUT:
     /kaggle/working/submission.zip              ← UPLOAD THIS TO CODABENCH
 """
 
-import sys, os, json, zipfile, shutil, time
+import sys, os, json, zipfile, shutil, time, pickle
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
@@ -38,6 +38,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from PIL import Image
+
+# ── NumPy 2.x to 1.x Pickle Compatibility Patch ─────────────────
+class CompatibilityPickler(pickle._Pickler):
+    def save_global(self, obj, name=None):
+        module = getattr(obj, '__module__', None)
+        if module and 'numpy._core' in module:
+            if name is None:
+                name = getattr(obj, '__qualname__', None)
+            if name is None:
+                name = obj.__name__
+            compat_module = module.replace('numpy._core', 'numpy.core')
+            self.write(pickle.GLOBAL + compat_module.encode('utf-8') + b'\n' + name.encode('utf-8') + b'\n')
+            self.memoize(obj)
+        else:
+            super().save_global(obj, name)
+
+def compat_pickle_dump(obj, file, protocol=None, *args, **kwargs):
+    p = CompatibilityPickler(file, protocol=protocol, *args, **kwargs)
+    p.dump(obj)
+
+pickle.dump = compat_pickle_dump
+# ──────────────────────────────────────────────────────────────
 
 # ── Force reload ──────────────────────────────────────────────
 for mod in list(sys.modules.keys()):
