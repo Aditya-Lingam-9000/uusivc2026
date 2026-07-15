@@ -69,8 +69,11 @@ for mod in list(sys.modules.keys()):
 # ── Config ────────────────────────────────────────────────────
 TRAIN   = globals().get("TRAIN_PATH", "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN")
 VAL_DIR = globals().get("VAL_PATH",   "/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL")
-CLS_CKPT = globals().get("CLS_CKPT",  "/kaggle/working/checkpoints/image_cls_best.pth")
-SEG_CKPT = globals().get("SEG_CKPT",  "/kaggle/working/checkpoints/image_seg_best.pth")
+CLS_CKPT      = globals().get("CLS_CKPT",      "/kaggle/working/checkpoints/image_cls_best.pth")
+SEG_CKPT      = globals().get("SEG_CKPT",      "/kaggle/working/checkpoints/image_seg_best.pth")
+CEUS_CLS_CKPT = globals().get("CEUS_CLS_CKPT", "/kaggle/working/checkpoints/ceus_cls_best.pth")
+CEUS_SEG_CKPT = globals().get("CEUS_SEG_CKPT", "/kaggle/working/checkpoints/ceus_seg_best.pth")
+VIDEO_SEG_CKPT= globals().get("VIDEO_SEG_CKPT","/kaggle/working/checkpoints/video_seg_best.pth")
 
 SUBMIT_DIR = Path("/kaggle/working/submission")
 SUBMIT_DIR.mkdir(parents=True, exist_ok=True)
@@ -218,55 +221,167 @@ del seg_model
 torch.cuda.empty_cache()
 
 # ═══════════════════════════════════════════════════════════════
-#  TASK 3: ceus_cls — PLACEHOLDER (all class 0, 50/50 prob)
-#  (Will be replaced after ceus_cls training)
+#  TASK 3: ceus_cls inference
 # ═══════════════════════════════════════════════════════════════
 print(f"\n{'='*55}")
-print("  TASK: ceus_cls  (PLACEHOLDER — train ceus_cls next)")
+print("  TASK: ceus_cls")
 print(f"{'='*55}")
 
-for s in by_task["ceus_cls"]:
-    classification_out[s["input_path_relative"]] = {
-        "prediction":  0,
-        "probability": [0.5, 0.5]     # neutral placeholder
-    }
-print(f"  ceus_cls placeholder: {len(by_task['ceus_cls'])} entries")
+if os.path.exists(CEUS_CLS_CKPT):
+    ceus_cls_model = build_model("ceus_cls", pretrained=False)
+    ckpt3 = torch.load(CEUS_CLS_CKPT, map_location=DEVICE)
+    ceus_cls_model.load_state_dict(ckpt3["model_state_dict"])
+    ceus_cls_model = ceus_cls_model.to(DEVICE)
+    ceus_cls_model.eval()
+    print(f"  Loaded ceus_cls checkpoint (epoch={ckpt3['epoch']}, val_acc={ckpt3['val_acc']:.4f})")
+
+    with torch.no_grad():
+        for s in by_task["ceus_cls"]:
+            part_root = get_partition_root(Path(TRAIN), Path(VAL_DIR), s["data_partition_group"])
+            npy_path  = part_root / s["input_path_relative"]
+            video = np.load(npy_path)                                # (64,256,512,3)
+            video_t = torch.tensor(video, dtype=torch.float32)
+            video_t = video_t.permute(0, 3, 1, 2) / 255.0           # (64,3,256,512)
+            video_t = video_t.unsqueeze(0).to(DEVICE)                # (1,64,3,256,512)
+
+            logits = ceus_cls_model(video_t)                         # (1,2)
+            probs  = torch.softmax(logits, dim=1)[0].cpu().tolist()
+            pred   = int(logits.argmax(dim=1).item())
+
+            classification_out[s["input_path_relative"]] = {
+                "prediction":  pred,
+                "probability": [round(probs[0], 4), round(probs[1], 4)]
+            }
+
+    print(f"  ceus_cls done: {len(by_task['ceus_cls'])} predictions")
+    del ceus_cls_model
+    torch.cuda.empty_cache()
+else:
+    print(f"  ⚠️ No ceus_cls checkpoint found at {CEUS_CLS_CKPT} — using placeholder")
+    for s in by_task["ceus_cls"]:
+        classification_out[s["input_path_relative"]] = {
+            "prediction": 0, "probability": [0.5, 0.5]
+        }
 
 # ═══════════════════════════════════════════════════════════════
-#  TASK 4: ceus_seg — PLACEHOLDER (empty masks)
+#  TASK 4: ceus_seg inference
 # ═══════════════════════════════════════════════════════════════
 print(f"\n{'='*55}")
-print("  TASK: ceus_seg  (PLACEHOLDER — empty masks)")
+print("  TASK: ceus_seg")
 print(f"{'='*55}")
 
-for s in by_task["ceus_seg"]:
-    target_name = s.get("target_name") or f"seg_annotation_{0:05d}.npz"
-    dataset_nm  = s.get("dataset_name", s["organ"])
-    out_dir     = SUBMIT_DIR / "ceus_seg" / dataset_nm / "annotations"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    empty_mask  = np.zeros((256, 512), dtype=np.uint8)
-    np.savez(str(out_dir / target_name), mask=empty_mask)
+if os.path.exists(CEUS_SEG_CKPT):
+    ceus_seg_model = build_model("ceus_seg", pretrained=False)
+    ckpt4 = torch.load(CEUS_SEG_CKPT, map_location=DEVICE)
+    ceus_seg_model.load_state_dict(ckpt4["model_state_dict"])
+    ceus_seg_model = ceus_seg_model.to(DEVICE)
+    ceus_seg_model.eval()
+    print(f"  Loaded ceus_seg checkpoint (epoch={ckpt4['epoch']}, val_dice={ckpt4['val_dice']:.4f})")
 
-print(f"  ceus_seg placeholder: {len(by_task['ceus_seg'])} empty masks saved")
+    n_ceus_seg_done = 0
+    with torch.no_grad():
+        for s in by_task["ceus_seg"]:
+            part_root = get_partition_root(Path(TRAIN), Path(VAL_DIR), s["data_partition_group"])
+            npy_path  = part_root / s["input_path_relative"]
+            video = np.load(npy_path)                                # (15,256,512,3)
+            mid_frame = video[7]                                     # (256,512,3)
+
+            frame_t = torch.tensor(mid_frame, dtype=torch.float32).permute(2, 0, 1) / 255.0
+            frame_t = normalize(frame_t).unsqueeze(0).to(DEVICE)     # (1,3,256,512)
+
+            logit = ceus_seg_model(frame_t)                          # (1,1,H,W)
+            prob  = torch.sigmoid(logit)
+            # Resize to (256, 512) if needed
+            if prob.shape[2:] != (256, 512):
+                prob = F.interpolate(prob, size=(256, 512), mode="bilinear", align_corners=False)
+            mask_bin = (prob[0, 0] > 0.5).cpu().numpy().astype(np.uint8) * 255
+
+            target_name = s.get("target_name") or f"seg_annotation_{n_ceus_seg_done:05d}.npz"
+            dataset_nm  = s.get("dataset_name", s["organ"])
+            out_dir     = SUBMIT_DIR / "ceus_seg" / dataset_nm / "annotations"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            np.savez(str(out_dir / target_name), mask=mask_bin)
+
+            n_ceus_seg_done += 1
+            if n_ceus_seg_done % 100 == 0:
+                print(f"  ceus_seg: {n_ceus_seg_done}/{len(by_task['ceus_seg'])} done")
+
+    print(f"  ceus_seg done: {n_ceus_seg_done} masks saved")
+    del ceus_seg_model
+    torch.cuda.empty_cache()
+else:
+    print(f"  ⚠️ No ceus_seg checkpoint found at {CEUS_SEG_CKPT} — using zero masks")
+    for s in by_task["ceus_seg"]:
+        target_name = s.get("target_name") or f"seg_annotation_{0:05d}.npz"
+        dataset_nm  = s.get("dataset_name", s["organ"])
+        out_dir     = SUBMIT_DIR / "ceus_seg" / dataset_nm / "annotations"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        np.savez(str(out_dir / target_name), mask=np.zeros((256, 512), dtype=np.uint8))
 
 # ═══════════════════════════════════════════════════════════════
-#  TASK 5: video_seg — PLACEHOLDER (empty frame dicts)
+#  TASK 5: video_seg inference
 # ═══════════════════════════════════════════════════════════════
 print(f"\n{'='*55}")
-print("  TASK: video_seg  (PLACEHOLDER — empty frame masks)")
+print("  TASK: video_seg")
 print(f"{'='*55}")
 
-for s in by_task["video_seg"]:
-    frame_indices = s.get("frame_indices") or [0]
-    fnum_mask = {str(fi): np.zeros((256, 256), dtype=np.uint8)
-                 for fi in frame_indices}
-    target_name = s.get("target_name") or f"seg_annotation_{0:05d}.npz"
-    dataset_nm  = s.get("dataset_name", "CardiacCH")
-    out_dir     = SUBMIT_DIR / "video_seg" / dataset_nm / "annotations"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(str(out_dir / target_name), fnum_mask=fnum_mask)
+if os.path.exists(VIDEO_SEG_CKPT):
+    # video_seg uses SegModel (same arch as image_seg) on individual frames
+    video_seg_model = build_model("image_seg", pretrained=False)
+    ckpt5 = torch.load(VIDEO_SEG_CKPT, map_location=DEVICE)
+    video_seg_model.load_state_dict(ckpt5["model_state_dict"])
+    video_seg_model = video_seg_model.to(DEVICE)
+    video_seg_model.eval()
+    print(f"  Loaded video_seg checkpoint (epoch={ckpt5['epoch']}, val_dice={ckpt5['val_dice']:.4f})")
 
-print(f"  video_seg placeholder: {len(by_task['video_seg'])} empty annotation files saved")
+    n_video_seg_done = 0
+    with torch.no_grad():
+        for s in by_task["video_seg"]:
+            part_root = get_partition_root(Path(TRAIN), Path(VAL_DIR), s["data_partition_group"])
+            npy_path  = part_root / s["input_path_relative"]
+            video = np.load(npy_path)                                # (3, T, 256, 256)
+
+            frame_indices = s.get("frame_indices") or [0]
+            fnum_mask = {}
+
+            for fi in frame_indices:
+                # Extract frame from view 0
+                frame = video[0, fi]                                 # (256, 256) float32 [0,255]
+                frame = frame / 255.0
+                frame_3ch = np.stack([frame, frame, frame], axis=0)  # (3, 256, 256)
+                frame_t = torch.tensor(frame_3ch, dtype=torch.float32)
+                frame_t = normalize(frame_t).unsqueeze(0).to(DEVICE) # (1,3,256,256)
+
+                logit = video_seg_model(frame_t)                     # (1,1,H,W)
+                prob  = torch.sigmoid(logit)
+                if prob.shape[2:] != (256, 256):
+                    prob = F.interpolate(prob, size=(256, 256), mode="bilinear", align_corners=False)
+                mask_bin = (prob[0, 0] > 0.5).cpu().numpy().astype(np.uint8) * 255
+                fnum_mask[str(fi)] = mask_bin
+
+            target_name = s.get("target_name") or f"seg_annotation_{n_video_seg_done:05d}.npz"
+            dataset_nm  = s.get("dataset_name", "CardiacCH")
+            out_dir     = SUBMIT_DIR / "video_seg" / dataset_nm / "annotations"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            np.savez(str(out_dir / target_name), fnum_mask=fnum_mask)
+
+            n_video_seg_done += 1
+            if n_video_seg_done % 20 == 0:
+                print(f"  video_seg: {n_video_seg_done}/{len(by_task['video_seg'])} done")
+
+    print(f"  video_seg done: {n_video_seg_done} annotation files saved")
+    del video_seg_model
+    torch.cuda.empty_cache()
+else:
+    print(f"  ⚠️ No video_seg checkpoint found at {VIDEO_SEG_CKPT} — using zero masks")
+    for s in by_task["video_seg"]:
+        frame_indices = s.get("frame_indices") or [0]
+        fnum_mask = {str(fi): np.zeros((256, 256), dtype=np.uint8) for fi in frame_indices}
+        target_name = s.get("target_name") or f"seg_annotation_{0:05d}.npz"
+        dataset_nm  = s.get("dataset_name", "CardiacCH")
+        out_dir     = SUBMIT_DIR / "video_seg" / dataset_nm / "annotations"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        np.savez(str(out_dir / target_name), fnum_mask=fnum_mask)
 
 # ═══════════════════════════════════════════════════════════════
 #  Save classification.json
@@ -303,13 +418,19 @@ with zipfile.ZipFile(zip_path, "r") as zf:
     if len(names) > 20:
         print(f"  ... ({len(names)} files total)")
 
+# ── Summary ────────────────────────────────────────────────────
+tasks_status = []
+for task, ckpt in [("image_cls", CLS_CKPT), ("image_seg", SEG_CKPT),
+                   ("ceus_cls", CEUS_CLS_CKPT), ("ceus_seg", CEUS_SEG_CKPT),
+                   ("video_seg", VIDEO_SEG_CKPT)]:
+    status = "✅" if os.path.exists(ckpt) else "⏳ placeholder"
+    tasks_status.append(f"   {task:12s}: {status}")
+
 print(f"\n{'='*55}")
 print(f"🎉 SUBMISSION READY")
 print(f"   File : /kaggle/working/submission.zip")
 print(f"   Size : {zip_size_mb:.1f} MB")
-print(f"   Tasks complete  : image_cls ✅  image_seg ✅")
-print(f"   Tasks placeholder: ceus_cls ⏳  ceus_seg ⏳  video_seg ⏳")
+for ts in tasks_status:
+    print(ts)
 print(f"\n   NEXT: Download submission.zip and upload to Codabench")
-print(f"   NOTE: Score will only count image_cls + image_seg for now")
-print(f"         Train ceus_cls, ceus_seg, video_seg next to improve score")
 print(f"{'='*55}")
