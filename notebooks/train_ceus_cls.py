@@ -31,7 +31,7 @@ for mod in list(sys.modules.keys()):
 TRAIN   = globals().get("TRAIN_PATH", "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN")
 VAL_DIR = globals().get("VAL_PATH",   "/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL")
 
-BATCH_SIZE   = 4         # videos are large (~25 MB each)
+BATCH_SIZE   = 16         # videos are large (~25 MB each)
 EPOCHS       = 20
 LR           = 1e-4
 WEIGHT_DECAY = 1e-4
