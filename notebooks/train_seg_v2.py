@@ -1,22 +1,19 @@
 """
-notebooks/train_seg_v2.py
-GPU-maximized segmentation training — image_seg, ceus_seg, video_seg.
+notebooks/train_seg_v2.py  —  UUSIVC segmentation training (image_seg, ceus_seg, video_seg)
 
-KEY OPTIMIZATIONS vs original:
-  - ALL tasks pre-extracted to .npy (np.load is 5x faster than PIL)
-  - num_workers=0 (no forking overhead / RAM leaks)
-  - Step-level logging every LOG_EVERY steps
-  - No boundary loss (scipy removed — was causing RAM leak)
-  - DataParallel with >=2 GPUs
-  - Larger batch → higher GPU utilization
+KEY DESIGN:
+  - Pre-extract PNGs/videos → .npy files in /tmp/preprocessed/
+      /tmp/ has 57.6 GB disk on Kaggle — will NEVER fill the 19.5 GB /kaggle/working/ limit
+  - FastNpySegDataset reads .npy per batch — fast, zero RAM accumulation
+  - num_workers=2 with persistent_workers — workers prefetch while GPU computes
+  - GPU-native augmentations: only torch.flip + noise (NO TF.affine — it syncs to CPU!)
+  - AMP + DataParallel for dual T4
 
 HOW TO RUN:
     TRAIN_PATH = "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN"
     VAL_PATH   = "/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL"
+    CFG_OVERRIDES = {"batch_size": 16, "epochs": 40}
     exec(open('/kaggle/working/repo/notebooks/train_seg_v2.py').read())
-
-OPTIONAL OVERRIDES (set before exec):
-    CFG_OVERRIDES = {"epochs": 30, "batch_size": 8}
 """
 
 import sys, os, json, random, time, gc
@@ -30,73 +27,10 @@ from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast, GradScaler
 from PIL import Image
 
-# ── Force module reload ────────────────────────────────────────
+# ── Force src module reload ────────────────────────────────────
 for mod in list(sys.modules.keys()):
     if mod.startswith("src"):
         del sys.modules[mod]
-
-import torchvision.transforms.functional as TF
-
-def apply_gpu_augmentations(imgs, masks):
-    """
-    Apply fast batch-wise augmentations directly on GPU.
-    imgs: (B, 3, H, W) float32 on GPU [0, 1]
-    masks: (B, 1, H, W) float32 on GPU {0, 1}
-    """
-    B, C, H, W = imgs.shape
-
-    # 1. Random Horizontal Flip (p=0.5)
-    if random.random() < 0.5:
-        imgs = torch.flip(imgs, dims=[-1])
-        masks = torch.flip(masks, dims=[-1])
-
-    # 2. Random Vertical Flip (p=0.2)
-    if random.random() < 0.2:
-        imgs = torch.flip(imgs, dims=[-2])
-        masks = torch.flip(masks, dims=[-2])
-
-    # 3. Random Affine (translation, scaling, rotation) (p=0.7)
-    if random.random() < 0.7:
-        angle = random.uniform(-30, 30)
-        tx = random.uniform(-0.1, 0.1) * W
-        ty = random.uniform(-0.1, 0.1) * H
-        scale = random.uniform(0.8, 1.2)
-        translate = [int(tx), int(ty)]
-        
-        imgs = TF.affine(imgs, angle=angle, translate=translate, scale=scale, shear=0.0, 
-                         interpolation=TF.InterpolationMode.BILINEAR)
-        masks = TF.affine(masks, angle=angle, translate=translate, scale=scale, shear=0.0, 
-                          interpolation=TF.InterpolationMode.NEAREST)
-
-    # 4. Color Jitter (Brightness/Contrast) (p=0.5)
-    if random.random() < 0.5:
-        brightness_factor = random.uniform(0.7, 1.3)
-        contrast_factor = random.uniform(0.7, 1.3)
-        imgs = TF.adjust_brightness(imgs, brightness_factor)
-        imgs = TF.adjust_contrast(imgs, contrast_factor)
-
-    # 5. Gaussian Noise / Speckle Noise (p=0.3)
-    if random.random() < 0.3:
-        noise = torch.randn_like(imgs) * random.uniform(0.01, 0.05)
-        imgs = torch.clamp(imgs + noise, 0.0, 1.0)
-
-    # 6. Coarse Dropout (Cutout) (p=0.3)
-    if random.random() < 0.3:
-        num_holes = random.randint(2, 6)
-        for _ in range(num_holes):
-            hh = random.randint(8, 32)
-            ww = random.randint(8, 32)
-            y = random.randint(0, H - hh)
-            x = random.randint(0, W - ww)
-            imgs[:, :, y:y+hh, x:x+ww] = 0.0
-
-    return imgs, masks
-
-def gpu_normalize(imgs):
-    """Normalize a batch of images on GPU using ImageNet mean/std."""
-    mean = torch.tensor([0.485, 0.456, 0.406], device=imgs.device).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=imgs.device).view(1, 3, 1, 1)
-    return (imgs - mean) / std
 
 # ── Config ────────────────────────────────────────────────────
 from src.config import get_cfg, print_cfg
@@ -108,9 +42,12 @@ if "TRAIN_PATH" in _gbl:
 if "VAL_PATH" in _gbl:
     cfg["val_root"] = _gbl["VAL_PATH"]
 
+# Use /tmp/ for pre-extracted .npy files — it has 57.6 GB disk space on Kaggle
+# This avoids filling the 19.5 GB /kaggle/working/ limit
+cfg["preprocess_dir"] = "/tmp/preprocessed"
 cfg["seg_loss"] = "dice_focal"        # no boundary loss (no scipy)
-cfg["num_workers"] = 0                # 0 workers is best for in-memory dataset + GPU augmentations (no leaks!)
-cfg["pin_memory"] = False             # not needed for num_workers=0
+cfg["num_workers"] = 2                # 2 workers prefetch while GPU computes
+cfg["pin_memory"] = True              # faster CPU→GPU transfer
 cfg.update(_gbl.get("CFG_OVERRIDES", {}))
 
 os.makedirs(cfg["ckpt_dir"], exist_ok=True)
@@ -118,36 +55,28 @@ os.makedirs(cfg["preprocess_dir"], exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 N_GPU = torch.cuda.device_count() if torch.cuda.is_available() else 0
-LOG_EVERY = cfg.get("log_every_n_batches", 50)  # print every N batches
+LOG_EVERY = cfg.get("log_every_n_batches", 25)
 
-print(f"Device   : {DEVICE}")
-if N_GPU > 0:
-    for i in range(N_GPU):
-        print(f"  GPU {i}  : {torch.cuda.get_device_name(i)}")
-    print(f"  N_GPU  : {N_GPU}")
-
-torch.manual_seed(cfg["seed"])
-random.seed(cfg["seed"])
-np.random.seed(cfg["seed"])
-
-from src.dataset import get_partition_root
-from src.models_v2 import build_seg_model
-from src.losses_v2 import CompoundSegLoss
-from src.augmentations_v2 import get_seg_train_transform, get_seg_val_transform
-from src.trainer import (
-    EMA, get_vram_usage, format_time,
-    build_optimizer, build_scheduler,
-    save_checkpoint, load_checkpoint, dice_score_fn,
-)
-
-print("✅ All imports OK")
-print_cfg(cfg)
-
-TRAIN = cfg["train_root"]
+TRAIN   = cfg["train_root"]
 VAL_DIR = cfg["val_root"]
 PREPROC = cfg["preprocess_dir"]
 
-# ── Load training ground truth ─────────────────────────────────
+# ── Src imports ────────────────────────────────────────────────
+from src.models_v2    import build_seg_model
+from src.losses_v2   import CompoundSegLoss
+from src.trainer     import (EMA, build_optimizer, build_scheduler,
+                              save_checkpoint, load_checkpoint,
+                              dice_score_fn, format_time, get_vram_usage)
+from src.dataset     import get_partition_root
+
+print(f"  Device : {DEVICE}")
+for i in range(N_GPU):
+    print(f"  GPU {i}  : {torch.cuda.get_device_name(i)}")
+print(f"  N_GPU  : {N_GPU}")
+print("✅ All imports OK")
+print_cfg(cfg)
+
+# ── Load ground-truth JSON ─────────────────────────────────────
 PRIVATE_GT = f"{TRAIN}/dataset_json_fingerprints_v4/private_train_ground_truth.json"
 PUBLIC_GT  = f"{TRAIN}/dataset_json_fingerprints_v4/public_all_ground_truth.json"
 
@@ -160,13 +89,10 @@ print(f"Total training samples loaded: {len(all_samples)}")
 
 
 # ═══════════════════════════════════════════════════════════════
-#  IN-MEMORY DATASET — reads from preloaded lists in RAM
+#  DATASET — reads pre-extracted .npy files from /tmp/
 # ═══════════════════════════════════════════════════════════════
-class InMemorySegDataset(Dataset):
-    """
-    Reads image and mask arrays directly from RAM.
-    Absolutely ZERO disk I/O during training.
-    """
+class FastNpySegDataset(Dataset):
+    """Reads (img.npy, mask.npy) pairs from disk. Fast np.load, zero RAM accumulation."""
     def __init__(self, records):
         self.records = records
 
@@ -175,168 +101,195 @@ class InMemorySegDataset(Dataset):
 
     def __getitem__(self, idx):
         r = self.records[idx]
-        img_np  = r["img_np"]   # (H, W, 3) uint8
-        mask_np = r["mask_np"]  # (H, W)    uint8 {0,1}
+        img_np  = np.load(r["img_path"])   # (H, W, 3) uint8
+        mask_np = np.load(r["mask_path"])  # (H, W) float32 {0,1}
 
-        img_t  = torch.from_numpy(img_np).permute(2, 0, 1)  # (3, H, W) uint8
-        mask_t = torch.from_numpy(mask_np).unsqueeze(0)     # (1, H, W) uint8
+        # Simple flips — fast CPU ops, no Albumentations overhead
+        if random.random() < 0.5:
+            img_np  = img_np[:, ::-1, :].copy()
+            mask_np = mask_np[:, ::-1].copy()
+        if random.random() < 0.2:
+            img_np  = img_np[::-1, :, :].copy()
+            mask_np = mask_np[::-1, :].copy()
+
+        img_t  = torch.from_numpy(img_np.copy()).permute(2, 0, 1).float() / 255.0
+        mask_t = torch.from_numpy(mask_np).unsqueeze(0).float()
 
         return {
-            "input":    img_t,
-            "mask":     mask_t.float(),
-            "dist_map": torch.zeros_like(mask_t).float(),
-            "organ":    r.get("organ", "Unknown"),
+            "input": img_t,
+            "mask":  mask_t,
+            "organ": r.get("organ", "Unknown"),
         }
 
 
+class ValNpySegDataset(Dataset):
+    """Reads (img.npy, mask.npy) for validation — no augmentation."""
+    def __init__(self, records):
+        self.records = records
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        r = self.records[idx]
+        img_np  = np.load(r["img_path"])
+        mask_np = np.load(r["mask_path"])
+        img_t  = torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
+        mask_t = torch.from_numpy(mask_np).unsqueeze(0).float()
+        return {
+            "input": img_t,
+            "mask":  mask_t,
+            "organ": r.get("organ", "Unknown"),
+        }
+
+
+# ── GPU-native normalization (fast, no CPU sync) ───────────────
+_MEAN = None
+_STD  = None
+
+def gpu_normalize(imgs):
+    global _MEAN, _STD
+    if _MEAN is None or _MEAN.device != imgs.device:
+        _MEAN = torch.tensor([0.485, 0.456, 0.406], device=imgs.device).view(1,3,1,1)
+        _STD  = torch.tensor([0.229, 0.224, 0.225], device=imgs.device).view(1,3,1,1)
+    return (imgs - _MEAN) / _STD
+
+
 # ═══════════════════════════════════════════════════════════════
-#  IN-MEMORY LOAD FUNCTIONS (Resizing done once during load)
+#  PRE-EXTRACTION → /tmp/preprocessed/  (57 GB disk, safe!)
 # ═══════════════════════════════════════════════════════════════
-def load_in_memory_image_seg(task_samples, train_root, val_root, target_size=(512, 512)):
-    """Load image_seg PNGs directly into RAM, resized to target_size to save RAM and maximize speed."""
-    records = []
-    skipped = 0
-    t0 = time.time()
-    total = len(task_samples)
-
-    for idx, s in enumerate(task_samples):
-        part_root = get_partition_root(
-            Path(train_root),
-            Path(val_root) if val_root else None,
-            s["data_partition_group"],
-        )
-        try:
-            img_raw  = Image.open(part_root / s["img_path_relative"]).convert("RGB")
-            mask_raw = Image.open(part_root / s["mask_path_relative"])
-
-            if img_raw.size != target_size:
-                img_raw = img_raw.resize(target_size, Image.BILINEAR)
-            if mask_raw.size != target_size:
-                mask_raw = mask_raw.resize(target_size, Image.NEAREST)
-
-            img_np = np.array(img_raw, dtype=np.uint8)
-            mask_np = np.array(mask_raw)
-            if mask_np.dtype == bool:
-                mask_np = mask_np.astype(np.uint8) * 255
-            if mask_np.ndim == 3:
-                mask_np = mask_np[:, :, 0]
-            mask_bin = (mask_np > 127).astype(np.uint8)
-
-            records.append({
-                "img_np":    img_np,
-                "mask_np":   mask_bin,
-                "sample_id": s["sample_id"],
-                "organ":     s.get("organ", s.get("dataset_name", "Unknown")),
-            })
-        except Exception as e:
-            skipped += 1
-            if skipped <= 5:
-                print(f"  [WARN] {s['sample_id']}: {e}")
-            continue
-
-        if (idx + 1) % 1000 == 0:
-            elapsed = time.time() - t0
-            eta = elapsed / (idx + 1) * (total - idx - 1)
-            print(f"  [{idx+1}/{total}] loaded to RAM | elapsed={format_time(elapsed)}  ETA={format_time(eta)}")
-
-    elapsed = time.time() - t0
-    print(f"  ✅ Loaded {len(records)} image_seg records to RAM in {format_time(elapsed)} (skipped={skipped})")
-    return records
-
-
-def load_in_memory_ceus_seg(task_samples, train_root, val_root, target_size=(512, 256)):
-    """Load middle frame of CEUS segmentations directly into RAM, resized to target_size."""
-    records = []
-    skipped = 0
-    t0 = time.time()
-    total = len(task_samples)
+def preextract_image_seg(task_samples, train_root, val_root, preproc_dir):
+    out_dir = Path(preproc_dir) / "image_seg"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    records, skipped = [], 0
+    t0, total = time.time(), len(task_samples)
 
     for idx, s in enumerate(task_samples):
         part_root = get_partition_root(
             Path(train_root), Path(val_root) if val_root else None,
             s["data_partition_group"],
         )
-        try:
-            video = np.load(part_root / s["input_path_relative"])  # (15,256,512,3)
-            mid   = video[video.shape[0] // 2].astype(np.uint8)    # (256,512,3)
+        sid   = s["sample_id"]
+        img_p = out_dir / f"{sid}_img.npy"
+        msk_p = out_dir / f"{sid}_msk.npy"
 
-            npz   = np.load(part_root / s["annotation_path_relative"])
-            mask  = (npz["mask"] > 127).astype(np.uint8)           # (256,512)
+        if not img_p.exists():
+            try:
+                img_raw  = np.array(Image.open(part_root / s["img_path_relative"]).convert("RGB"), dtype=np.uint8)
+                mask_raw = np.array(Image.open(part_root / s["mask_path_relative"]))
+                if mask_raw.dtype == bool:
+                    mask_raw = mask_raw.astype(np.uint8) * 255
+                if mask_raw.ndim == 3:
+                    mask_raw = mask_raw[:, :, 0]
+                mask_bin = (mask_raw > 127).astype(np.float32)
+                np.save(str(img_p),  img_raw)
+                np.save(str(msk_p), mask_bin)
+            except Exception as e:
+                skipped += 1
+                if skipped <= 5:
+                    print(f"  [WARN] {sid}: {e}")
+                continue
 
-            if (mid.shape[1], mid.shape[0]) != target_size:
-                mid = np.array(Image.fromarray(mid).resize(target_size, Image.BILINEAR), dtype=np.uint8)
-            if (mask.shape[1], mask.shape[0]) != target_size:
-                mask = np.array(Image.fromarray(mask).resize(target_size, Image.NEAREST), dtype=np.uint8)
+        records.append({
+            "img_path":  str(img_p),
+            "mask_path": str(msk_p),
+            "sample_id": sid,
+            "organ":     s.get("organ", s.get("dataset_name", "Unknown")),
+        })
+        if (idx + 1) % 500 == 0:
+            el = time.time() - t0
+            eta = el / (idx + 1) * (total - idx - 1)
+            print(f"  [{idx+1}/{total}]  elapsed={format_time(el)}  ETA={format_time(eta)}")
 
-            records.append({
-                "img_np":    mid,
-                "mask_np":   mask,
-                "sample_id": s["sample_id"],
-                "organ":     s.get("organ", "Unknown"),
-            })
-        except Exception as e:
-            skipped += 1
-            continue
-
-        if (idx + 1) % 300 == 0:
-            print(f"  [{idx+1}/{total}] loaded to RAM")
-
-    print(f"  ✅ Loaded {len(records)} ceus_seg records to RAM (skipped={skipped})")
+    print(f"  ✅ image_seg: {len(records)} records (skipped={skipped})")
     return records
 
 
-def load_in_memory_video_seg(task_samples, train_root, val_root, target_size=(256, 256)):
-    """Load frames of video segmentations directly into RAM, resized to target_size."""
-    records = []
-    t0 = time.time()
-    total = len(task_samples)
+def preextract_ceus_seg(task_samples, train_root, val_root, preproc_dir):
+    out_dir = Path(preproc_dir) / "ceus_seg"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    records, skipped = [], 0
 
     for idx, s in enumerate(task_samples):
         part_root = get_partition_root(
             Path(train_root), Path(val_root) if val_root else None,
             s["data_partition_group"],
         )
+        sid   = s["sample_id"]
+        img_p = out_dir / f"{sid}_img.npy"
+        msk_p = out_dir / f"{sid}_msk.npy"
+
+        if not img_p.exists():
+            try:
+                video = np.load(part_root / s["input_path_relative"])
+                mid   = video[video.shape[0] // 2].astype(np.uint8)
+                np.save(str(img_p), mid)
+                npz  = np.load(part_root / s["annotation_path_relative"])
+                mask = (npz["mask"] > 127).astype(np.float32)
+                np.save(str(msk_p), mask)
+            except Exception as e:
+                skipped += 1
+                continue
+
+        records.append({
+            "img_path":  str(img_p),
+            "mask_path": str(msk_p),
+            "sample_id": sid,
+            "organ":     s.get("organ", "Unknown"),
+        })
+        if (idx + 1) % 200 == 0:
+            print(f"  ceus_seg [{idx+1}/{len(task_samples)}]")
+
+    print(f"  ✅ ceus_seg: {len(records)} records (skipped={skipped})")
+    return records
+
+
+def preextract_video_seg(task_samples, train_root, val_root, preproc_dir):
+    out_dir = Path(preproc_dir) / "video_seg"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+
+    for idx, s in enumerate(task_samples):
+        part_root = get_partition_root(
+            Path(train_root), Path(val_root) if val_root else None,
+            s["data_partition_group"],
+        )
+        sid = s["sample_id"]
         try:
             npz       = np.load(part_root / s["annotation_path_relative"], allow_pickle=True)
             fnum_mask = npz["fnum_mask"].item()
             video     = None
-
             for frame_key, mask_arr in fnum_mask.items():
                 fidx  = int(frame_key)
-                if video is None:
-                    video = np.load(part_root / s["input_path_relative"])
-                frame = video[0, fidx]  # (256,256) float
-                frame_u8 = np.clip(frame, 0, 255).astype(np.uint8)
-                frame_3ch = np.stack([frame_u8, frame_u8, frame_u8], axis=-1)
-                mask_bin = (mask_arr > 127).astype(np.uint8)
-
-                if (frame_3ch.shape[1], frame_3ch.shape[0]) != target_size:
-                    frame_3ch = np.array(Image.fromarray(frame_3ch).resize(target_size, Image.BILINEAR), dtype=np.uint8)
-                if (mask_bin.shape[1], mask_bin.shape[0]) != target_size:
-                    mask_bin = np.array(Image.fromarray(mask_bin).resize(target_size, Image.NEAREST), dtype=np.uint8)
-
+                img_p = out_dir / f"{sid}_f{fidx}_img.npy"
+                msk_p = out_dir / f"{sid}_f{fidx}_msk.npy"
+                if not img_p.exists():
+                    if video is None:
+                        video = np.load(part_root / s["input_path_relative"])
+                    frame    = video[0, fidx]
+                    frame_u8 = np.clip(frame, 0, 255).astype(np.uint8)
+                    frame_3  = np.stack([frame_u8] * 3, axis=-1)
+                    msk_bin  = (mask_arr > 127).astype(np.float32)
+                    np.save(str(img_p), frame_3)
+                    np.save(str(msk_p), msk_bin)
                 records.append({
-                    "img_np":    frame_3ch,
-                    "mask_np":   mask_bin,
-                    "sample_id": s["sample_id"],
+                    "img_path":  str(img_p),
+                    "mask_path": str(msk_p),
+                    "sample_id": sid,
                     "organ":     s.get("organ", "Cardiac"),
                 })
             del video
-        except Exception as e:
-            continue
+        except Exception:
+            pass
+        if (idx + 1) % 200 == 0:
+            print(f"  video_seg [{idx+1}/{len(task_samples)}]")
 
-        if (idx + 1) % 300 == 0:
-            print(f"  [{idx+1}/{total}] loaded to RAM")
-
-    print(f"  ✅ Loaded {len(records)} video_seg records to RAM")
+    print(f"  ✅ video_seg: {len(records)} records")
     return records
 
 
-# ═══════════════════════════════════════════════════════════════
-#  HELPER: build train/val split from records
-# ═══════════════════════════════════════════════════════════════
+# ── Train/val split ────────────────────────────────────────────
 def split_records(records, val_frac, seed):
-    """Stratified split by organ."""
     random.seed(seed)
     organ_to_idx = defaultdict(list)
     for i, r in enumerate(records):
@@ -347,9 +300,7 @@ def split_records(records, val_frac, seed):
         n_val = max(1, int(len(idxs) * val_frac))
         val_idx.extend(idxs[:n_val])
         train_idx.extend(idxs[n_val:])
-    train_recs = [records[i] for i in train_idx]
-    val_recs   = [records[i] for i in val_idx]
-    return train_recs, val_recs
+    return [records[i] for i in train_idx], [records[i] for i in val_idx]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -366,42 +317,29 @@ for current_task in cfg["seg_tasks"]:
         print("  ⚠️  No samples, skipping")
         continue
 
-    # ── Determine resolution and task prefix ──────────────────
     if current_task == "image_seg":
-        img_size = cfg["img_size_seg"]
         cfg["ckpt_prefix"] = "image_seg"
     elif current_task == "ceus_seg":
-        img_size = cfg["img_size_ceus_seg"]
         cfg["ckpt_prefix"] = "ceus_seg"
     elif current_task == "video_seg":
-        img_size = cfg["img_size_video_seg"]
         cfg["ckpt_prefix"] = "video_seg"
-    else:
-        img_size = cfg["img_size_seg"]
-        cfg["ckpt_prefix"] = current_task
 
-    if isinstance(img_size, (list, tuple)):
-        pil_size = (img_size[1], img_size[0])  # (width, height)
-    else:
-        pil_size = (img_size, img_size)
-
-    # ── IN-MEMORY LOAD ─────────────────────────────────────────
-    print(f"\n  📦 Loading {current_task} into memory (resize to {pil_size[1]}x{pil_size[0]})...")
+    # ── Pre-extract to /tmp/ ───────────────────────────────────
+    print(f"\n  📦 Pre-extracting {current_task} → {PREPROC}  (57GB /tmp/ disk)")
     t_pre = time.time()
     if current_task == "image_seg":
-        all_records = load_in_memory_image_seg(task_samples, TRAIN, VAL_DIR, target_size=pil_size)
+        all_records = preextract_image_seg(task_samples, TRAIN, VAL_DIR, PREPROC)
     elif current_task == "ceus_seg":
-        all_records = load_in_memory_ceus_seg(task_samples, TRAIN, VAL_DIR, target_size=pil_size)
+        all_records = preextract_ceus_seg(task_samples, TRAIN, VAL_DIR, PREPROC)
     elif current_task == "video_seg":
-        all_records = load_in_memory_video_seg(task_samples, TRAIN, VAL_DIR, target_size=pil_size)
-    print(f"  Load complete: {format_time(time.time()-t_pre)}")
+        all_records = preextract_video_seg(task_samples, TRAIN, VAL_DIR, PREPROC)
+    print(f"  Pre-extraction: {format_time(time.time() - t_pre)}")
 
-    # For video_seg: split by sample_id to avoid leakage
     if current_task == "video_seg":
         all_ids = list(set(r["sample_id"] for r in all_records))
         random.seed(cfg["seed"])
         random.shuffle(all_ids)
-        n_val = max(1, int(len(all_ids) * cfg["val_split"]))
+        n_val   = max(1, int(len(all_ids) * cfg["val_split"]))
         val_ids = set(all_ids[:n_val])
         train_records = [r for r in all_records if r["sample_id"] not in val_ids]
         val_records   = [r for r in all_records if r["sample_id"] in val_ids]
@@ -410,39 +348,31 @@ for current_task in cfg["seg_tasks"]:
 
     print(f"  Train: {len(train_records)}  Val: {len(val_records)}")
 
-    # ── DataLoaders (workers prefetch batches → GPU stays fed) ──
-    train_ds = InMemorySegDataset(train_records)
-    val_ds   = InMemorySegDataset(val_records)
-
+    # ── DataLoaders ────────────────────────────────────────────
     bs = cfg["batch_size"]
     nw = cfg["num_workers"]
-    pf = 2 if nw > 0 else None
-    loader_kwargs = dict(
-        num_workers=nw,
-        pin_memory=cfg["pin_memory"],
-        persistent_workers=(nw > 0),   # keep workers alive between epochs
-        prefetch_factor=pf,            # prefetch 2 batches per worker
-    )
+    train_ds = FastNpySegDataset(train_records)
+    val_ds   = ValNpySegDataset(val_records)
     train_loader = DataLoader(
-        train_ds, batch_size=bs, shuffle=True,
-        drop_last=True, **loader_kwargs,
+        train_ds, batch_size=bs, shuffle=True, drop_last=True,
+        num_workers=nw, pin_memory=cfg["pin_memory"],
+        persistent_workers=(nw > 0), prefetch_factor=2 if nw > 0 else None,
     )
     val_loader = DataLoader(
         val_ds, batch_size=bs, shuffle=False,
-        **loader_kwargs,
+        num_workers=nw, pin_memory=cfg["pin_memory"],
+        persistent_workers=(nw > 0), prefetch_factor=2 if nw > 0 else None,
     )
     print(f"  Train batches: {len(train_loader)}  Val batches: {len(val_loader)}")
-    print(f"  Effective batch/step: {bs} × {max(N_GPU,1)} GPUs = {bs*max(N_GPU,1)}")
-    print(f"  Workers: {nw}  pin_memory: {cfg['pin_memory']}  prefetch: {pf}")
+    print(f"  Effective batch: {bs} × {max(N_GPU,1)} GPUs = {bs*max(N_GPU,1)}")
 
-    # ── Model ─────────────────────────────────────────────────
+    # ── Model ──────────────────────────────────────────────────
     model = build_seg_model(cfg)
     if N_GPU > 1:
         print(f"  Wrapping in DataParallel ({N_GPU} GPUs)")
         model = nn.DataParallel(model)
     model = model.to(DEVICE)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"  Model params: {n_params:,}")
+    print(f"  Model params: {sum(p.numel() for p in model.parameters()):,}")
 
     # ── Loss / Optimizer / Scheduler ──────────────────────────
     criterion = CompoundSegLoss(cfg)
@@ -461,32 +391,28 @@ for current_task in cfg["seg_tasks"]:
     for epoch in range(start_epoch, cfg["epochs"] + 1):
         t_epoch = time.time()
 
-        # ═══════════ TRAIN ═══════════
+        # ═════════ TRAIN ═════════
         model.train()
-        stats    = defaultdict(float)
-        n_train  = 0
-
+        stats   = defaultdict(float)
+        n_train = 0
         optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(train_loader):
-            imgs     = batch["input"].to(DEVICE, non_blocking=True).float() / 255.0
-            masks    = batch["mask"].to(DEVICE, non_blocking=True)
+            imgs  = batch["input"].to(DEVICE, non_blocking=True)
+            masks = batch["mask"].to(DEVICE, non_blocking=True)
 
-            # Apply fast batch-wise augmentations directly on GPU
-            imgs, masks = apply_gpu_augmentations(imgs, masks)
+            # GPU-native normalize (no CPU sync)
             imgs = gpu_normalize(imgs)
 
             with autocast("cuda", enabled=cfg["use_amp"]):
                 logits = model(imgs)
                 if logits.shape[2:] != masks.shape[2:]:
-                    logits = F.interpolate(
-                        logits, size=masks.shape[2:],
-                        mode="bilinear", align_corners=False,
-                    )
+                    logits = F.interpolate(logits, size=masks.shape[2:],
+                                           mode="bilinear", align_corners=False)
                 loss, loss_parts = criterion(logits, masks, None)
-                loss_scaled = loss / accum
+                loss = loss / accum
 
-            scaler.scale(loss_scaled).backward()
+            scaler.scale(loss).backward()
 
             if (batch_idx + 1) % accum == 0 or (batch_idx + 1) == len(train_loader):
                 scaler.unscale_(optimizer)
@@ -498,35 +424,29 @@ for current_task in cfg["seg_tasks"]:
                     ema.update(model)
 
             bs_actual = imgs.size(0)
-            stats["loss"]       += loss.item() * bs_actual
+            stats["loss"]       += loss.item() * accum * bs_actual
             stats["dice_loss"]  += loss_parts["dice"] * bs_actual
             stats["focal_loss"] += loss_parts["focal"] * bs_actual
-            stats["dice"]       += dice_score_fn(logits, masks).item() * bs_actual
-            n_train             += bs_actual
+            with torch.no_grad():
+                stats["dice"] += dice_score_fn(logits.detach(), masks).item() * bs_actual
+            n_train += bs_actual
 
-            # ── Step-level log ────────────────────────────────
             if (batch_idx + 1) % LOG_EVERY == 0:
-                step_loss = stats["loss"] / max(n_train, 1)
-                step_dice = stats["dice"] / max(n_train, 1)
-                elapsed   = time.time() - t_epoch
-                steps_done = batch_idx + 1
-                steps_tot  = len(train_loader)
-                eta_step   = elapsed / steps_done * (steps_tot - steps_done)
-                lr_now     = optimizer.param_groups[0]["lr"]
+                sl  = stats["loss"] / max(n_train, 1)
+                sd  = stats["dice"] / max(n_train, 1)
+                el  = time.time() - t_epoch
+                eta = el / (batch_idx + 1) * (len(train_loader) - batch_idx - 1)
+                lr  = optimizer.param_groups[0]["lr"]
                 print(
-                    f"  Ep[{epoch:02d}] "
-                    f"Step[{steps_done:04d}/{steps_tot}] "
-                    f"loss={step_loss:.4f} "
-                    f"dice={step_dice:.4f} "
-                    f"lr={lr_now:.2e} "
-                    f"VRAM={get_vram_usage()} "
-                    f"ETA={format_time(eta_step)}"
+                    f"  Ep[{epoch:02d}] Step[{batch_idx+1:04d}/{len(train_loader)}] "
+                    f"loss={sl:.4f} dice={sd:.4f} lr={lr:.2e} "
+                    f"VRAM={get_vram_usage()} ETA={format_time(eta)}"
                 )
 
         if scheduler:
             scheduler.step()
 
-        # ═══════════ VALIDATE ════════
+        # ═════════ VALIDATE ═════════
         model.eval()
         if ema:
             ema.apply(model)
@@ -537,25 +457,21 @@ for current_task in cfg["seg_tasks"]:
 
         with torch.no_grad():
             for batch in val_loader:
-                imgs   = batch["input"].to(DEVICE, non_blocking=True).float() / 255.0
+                imgs   = batch["input"].to(DEVICE, non_blocking=True)
                 masks  = batch["mask"].to(DEVICE, non_blocking=True)
                 organs = batch["organ"]
-
-                imgs = gpu_normalize(imgs)
+                imgs   = gpu_normalize(imgs)
 
                 with autocast("cuda", enabled=cfg["use_amp"]):
                     logits = model(imgs)
                     if logits.shape[2:] != masks.shape[2:]:
-                        logits = F.interpolate(
-                            logits, size=masks.shape[2:],
-                            mode="bilinear", align_corners=False,
-                        )
+                        logits = F.interpolate(logits, size=masks.shape[2:],
+                                               mode="bilinear", align_corners=False)
                     loss, _ = criterion(logits, masks, None)
 
                 bs_v = imgs.size(0)
                 val_stats["loss"] += loss.item() * bs_v
-                d = dice_score_fn(logits, masks).item()
-                val_stats["dice"] += d * bs_v
+                val_stats["dice"] += dice_score_fn(logits, masks).item() * bs_v
                 n_val += bs_v
 
                 for i, organ in enumerate(organs):
@@ -566,30 +482,18 @@ for current_task in cfg["seg_tasks"]:
         if ema:
             ema.restore(model)
 
-        # ═══════════ EPOCH SUMMARY ══
-        train_loss = stats["loss"] / max(n_train, 1)
-        train_dice = stats["dice"] / max(n_train, 1)
-        val_loss   = val_stats["loss"] / max(n_val, 1)
-        val_dice   = val_stats["dice"] / max(n_val, 1)
-        elapsed    = time.time() - t_epoch
-        eta_total  = elapsed * (cfg["epochs"] - epoch)
-        lr_now     = optimizer.param_groups[0]["lr"]
+        # ═════════ EPOCH SUMMARY ═════════
+        tl = stats["loss"]  / max(n_train, 1)
+        td = stats["dice"]  / max(n_train, 1)
+        vl = val_stats["loss"] / max(n_val, 1)
+        vd = val_stats["dice"] / max(n_val, 1)
+        el = time.time() - t_epoch
+        lr = optimizer.param_groups[0]["lr"]
 
         print(f"\n{'─'*60}")
-        print(
-            f"  ✅ EPOCH {epoch:02d}/{cfg['epochs']}  "
-            f"time={format_time(elapsed)}  "
-            f"ETA={format_time(eta_total)}  "
-            f"LR={lr_now:.2e}"
-        )
-        print(
-            f"  Train → loss={train_loss:.4f}  dice={train_dice:.4f}  "
-            f"(dice_l={stats['dice_loss']/max(n_train,1):.4f}  "
-            f"focal_l={stats['focal_loss']/max(n_train,1):.4f})"
-        )
-        print(f"  Val   → loss={val_loss:.4f}  dice={val_dice:.4f}  "
-              f"(best={best_metric:.4f})  VRAM={get_vram_usage()}")
-
+        print(f"  ✅ EPOCH {epoch:02d}/{cfg['epochs']}  time={format_time(el)}  LR={lr:.2e}")
+        print(f"  Train → loss={tl:.4f}  dice={td:.4f}")
+        print(f"  Val   → loss={vl:.4f}  dice={vd:.4f}  (best={best_metric:.4f})  VRAM={get_vram_usage()}")
         if organ_dice:
             print("  Per-organ val dice:")
             for org in sorted(organ_dice):
@@ -598,46 +502,43 @@ for current_task in cfg["seg_tasks"]:
         print(f"{'─'*60}")
 
         # ── Checkpoint ────────────────────────────────────────
-        is_best = val_dice > best_metric
+        is_best = vd > best_metric
         if is_best:
-            best_metric = val_dice
+            best_metric = vd
             patience_counter = 0
         else:
             patience_counter += 1
 
         save_checkpoint(model, optimizer, scheduler, scaler, epoch,
                         best_metric, history, cfg, is_best=is_best)
-        history.append({
-            "epoch": epoch, "train_loss": train_loss, "train_dice": train_dice,
-            "val_loss": val_loss, "val_dice": val_dice,
-        })
+        history.append({"epoch": epoch, "train_loss": tl, "train_dice": td,
+                         "val_loss": vl, "val_dice": vd})
 
         if cfg["early_stop_patience"] > 0 and patience_counter >= cfg["early_stop_patience"]:
             print(f"\n  ⏹ Early stopping (patience={cfg['early_stop_patience']})")
             break
 
-    # ── Save history ──────────────────────────────────────────
     pfx = cfg["ckpt_prefix"]
     with open(f"{cfg['ckpt_dir']}/{pfx}_history.json", "w") as f:
         json.dump(history, f, indent=2)
 
     print(f"\n{'='*60}")
     print(f"  🎉 {current_task} DONE — Best val dice: {best_metric:.4f}")
-    print(f"     Checkpoint: {cfg['ckpt_dir']}/{pfx}_best.pth")
     print(f"{'='*60}")
 
-    # ── Cleanup GPU/RAM for next task ─────────────────────────
+    # ── Cleanup GPU/RAM for next task ──────────────────────────
     del model, optimizer, scheduler, scaler, ema
     del train_ds, val_ds, train_loader, val_loader
     del all_records, train_records, val_records
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    time.sleep(2)  # give OS time to release memory
-
+    time.sleep(2)
     best_metric = 0.0
-    history = []
+    history     = []
     cfg["resume_from"] = None
+    _MEAN = None   # reset cached normalize tensors
+    _STD  = None
 
 print(f"\n{'='*60}")
 print(f"  🏁 ALL SEGMENTATION TASKS COMPLETE")
