@@ -1,7 +1,9 @@
 """
 src/augmentations_v2.py
-Competition-grade augmentation pipelines using Albumentations.
-Separate pipelines for segmentation vs classification tasks.
+GPU-optimized augmentation pipelines using Albumentations.
+API-compatible with Albumentations >=1.4.
+ElasticTransform removed — too slow for CPU-side loading.
+All fast GPU-friendly transforms only.
 """
 
 import albumentations as A
@@ -10,7 +12,7 @@ import numpy as np
 
 
 def get_seg_train_transform(img_size=512):
-    """Heavy augmentation for segmentation training."""
+    """Fast + effective augmentation for segmentation training."""
     if isinstance(img_size, (list, tuple)):
         h, w = img_size
     else:
@@ -19,22 +21,20 @@ def get_seg_train_transform(img_size=512):
     return A.Compose([
         A.Resize(h, w),
 
-        # Geometric transforms
-        A.ShiftScaleRotate(
-            shift_limit=0.1, scale_limit=0.2, rotate_limit=30,
-            border_mode=0, p=0.7,
+        # Geometric — fast, no elastic/grid distortion
+        A.Affine(
+            translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
+            scale=(0.8, 1.2),
+            rotate=(-30, 30),
+            border_mode=0,
+            p=0.7,
         ),
-        A.OneOf([
-            A.ElasticTransform(alpha=120, sigma=120 * 0.05, p=1.0),
-            A.GridDistortion(num_steps=5, distort_limit=0.3, p=1.0),
-            A.OpticalDistortion(distort_limit=0.05, shift_limit=0.05, p=1.0),
-        ], p=0.4),
 
         # Flips
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.2),
 
-        # Intensity transforms (critical for ultrasound domain generalization)
+        # Intensity — critical for ultrasound domain generalization
         A.OneOf([
             A.CLAHE(clip_limit=4.0, p=1.0),
             A.RandomBrightnessContrast(
@@ -43,17 +43,19 @@ def get_seg_train_transform(img_size=512):
             A.RandomGamma(gamma_limit=(70, 130), p=1.0),
         ], p=0.5),
 
-        # Noise (simulate ultrasound speckle)
+        # Noise — simulate ultrasound speckle
         A.OneOf([
-            A.GaussNoise(var_limit=(10, 50), p=1.0),
+            A.GaussNoise(p=1.0),
             A.MultiplicativeNoise(multiplier=(0.9, 1.1), p=1.0),
         ], p=0.3),
 
-        # Cutout (forces model to learn context)
+        # Cutout — forces model to learn context
         A.CoarseDropout(
-            max_holes=8, max_height=32, max_width=32,
-            min_holes=2, min_height=8, min_width=8,
-            fill_value=0, p=0.3,
+            num_holes_range=(2, 8),
+            hole_height_range=(8, 32),
+            hole_width_range=(8, 32),
+            fill=0,
+            p=0.3,
         ),
 
         # Normalize with ImageNet stats
@@ -77,14 +79,17 @@ def get_seg_val_transform(img_size=512):
 
 
 def get_cls_train_transform(img_size=384):
-    """Heavy augmentation for classification training."""
+    """Fast + effective augmentation for classification training."""
     return A.Compose([
         A.Resize(img_size, img_size),
 
         # Geometric
-        A.ShiftScaleRotate(
-            shift_limit=0.1, scale_limit=0.15, rotate_limit=20,
-            border_mode=0, p=0.6,
+        A.Affine(
+            translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
+            scale=(0.85, 1.15),
+            rotate=(-20, 20),
+            border_mode=0,
+            p=0.6,
         ),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.1),
@@ -99,12 +104,15 @@ def get_cls_train_transform(img_size=384):
         ], p=0.5),
 
         # Noise
-        A.GaussNoise(var_limit=(10, 50), p=0.2),
+        A.GaussNoise(p=0.2),
 
         # Cutout
         A.CoarseDropout(
-            max_holes=6, max_height=24, max_width=24,
-            fill_value=0, p=0.3,
+            num_holes_range=(1, 6),
+            hole_height_range=(8, 24),
+            hole_width_range=(8, 24),
+            fill=0,
+            p=0.3,
         ),
 
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
