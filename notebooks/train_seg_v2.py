@@ -46,8 +46,8 @@ if "VAL_PATH" in _gbl:
     cfg["val_root"] = _gbl["VAL_PATH"]
 
 cfg["seg_loss"] = "dice_focal"        # no boundary loss (no scipy)
-cfg["num_workers"] = 0                # no fork/RAM leaks
-cfg["pin_memory"] = False             # DataParallel handles its own pinning
+cfg["num_workers"] = 4                # safe with .npy pipeline (no PIL/scipy in workers)
+cfg["pin_memory"] = True              # faster host→device transfer
 cfg.update(_gbl.get("CFG_OVERRIDES", {}))
 
 os.makedirs(cfg["ckpt_dir"], exist_ok=True)
@@ -368,25 +368,30 @@ for current_task in cfg["seg_tasks"]:
 
     print(f"  Train: {len(train_records)}  Val: {len(val_records)}")
 
-    # ── DataLoaders (num_workers=0 — no fork/RAM leaks) ────────
+    # ── DataLoaders (workers prefetch .npy batches → GPU stays fed) ──
     train_ds = FastNpySegDataset(train_records, train_aug)
     val_ds   = FastNpySegDataset(val_records, val_aug)
 
     # Effective batch = batch_size * N_GPU (DataParallel doubles throughput)
     bs = cfg["batch_size"]
+    nw = cfg["num_workers"]
+    loader_kwargs = dict(
+        num_workers=nw,
+        pin_memory=cfg["pin_memory"],
+        persistent_workers=(nw > 0),   # keep workers alive between epochs
+        prefetch_factor=4 if nw > 0 else None,  # prefetch 4 batches per worker
+    )
     train_loader = DataLoader(
         train_ds, batch_size=bs, shuffle=True,
-        num_workers=cfg["num_workers"],
-        pin_memory=cfg["pin_memory"],
-        drop_last=True,
+        drop_last=True, **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds, batch_size=bs, shuffle=False,
-        num_workers=cfg["num_workers"],
-        pin_memory=cfg["pin_memory"],
+        **loader_kwargs,
     )
     print(f"  Train batches: {len(train_loader)}  Val batches: {len(val_loader)}")
     print(f"  Effective batch/step: {bs} × {max(N_GPU,1)} GPUs = {bs*max(N_GPU,1)}")
+    print(f"  Workers: {nw}  pin_memory: {cfg['pin_memory']}  prefetch: 4")
 
     # ── Model ─────────────────────────────────────────────────
     model = build_seg_model(cfg)
