@@ -46,7 +46,7 @@ if "VAL_PATH" in _gbl:
     cfg["val_root"] = _gbl["VAL_PATH"]
 
 cfg["seg_loss"] = "dice_focal"        # no boundary loss (no scipy)
-cfg["num_workers"] = 4                # safe with .npy pipeline (no PIL/scipy in workers)
+cfg["num_workers"] = 2                # 2 workers are optimal for in-memory dataset
 cfg["pin_memory"] = True              # faster host→device transfer
 cfg.update(_gbl.get("CFG_OVERRIDES", {}))
 
@@ -97,13 +97,12 @@ print(f"Total training samples loaded: {len(all_samples)}")
 
 
 # ═══════════════════════════════════════════════════════════════
-#  FAST NUMPY DATASET — loads pre-extracted .npy files only
+#  IN-MEMORY DATASET — reads from preloaded lists in RAM
 # ═══════════════════════════════════════════════════════════════
-class FastNpySegDataset(Dataset):
+class InMemorySegDataset(Dataset):
     """
-    Loads pre-extracted (img.npy, mask.npy) pairs.
-    np.load is ~5x faster than PIL for large images.
-    No scipy, no PIL, no multiprocessing needed.
+    Reads image and mask arrays directly from RAM.
+    Absolutely ZERO disk I/O during training.
     """
     def __init__(self, records, transform):
         self.records = records
@@ -114,12 +113,8 @@ class FastNpySegDataset(Dataset):
 
     def __getitem__(self, idx):
         r = self.records[idx]
-        img_np  = np.load(r["img_path"])   # (H, W, 3) uint8
-        mask_np = np.load(r["mask_path"])  # (H, W)    float32 {0,1}
-
-        # Ensure uint8 for albumentations
-        if img_np.dtype != np.uint8:
-            img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+        img_np  = r["img_np"]   # (H, W, 3) uint8
+        mask_np = r["mask_np"]  # (H, W)    uint8 {0,1}
 
         if self.transform:
             out    = self.transform(image=img_np, mask=mask_np)
@@ -141,15 +136,10 @@ class FastNpySegDataset(Dataset):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  PRE-EXTRACTION FUNCTIONS
+#  IN-MEMORY LOAD FUNCTIONS
 # ═══════════════════════════════════════════════════════════════
-def preextract_image_seg(task_samples, train_root, val_root, preproc_dir):
-    """
-    Convert image_seg PNGs → (img.npy, mask.npy) pairs.
-    Much faster than PIL loading in training loop.
-    """
-    out_dir = Path(preproc_dir) / "image_seg"
-    out_dir.mkdir(parents=True, exist_ok=True)
+def load_in_memory_image_seg(task_samples, train_root, val_root):
+    """Load image_seg PNGs directly into RAM to save disk space and maximize speed."""
     records = []
     skipped = 0
     t0 = time.time()
@@ -161,99 +151,84 @@ def preextract_image_seg(task_samples, train_root, val_root, preproc_dir):
             Path(val_root) if val_root else None,
             s["data_partition_group"],
         )
-        sid = s["sample_id"]
-        img_p  = out_dir / f"{sid}_img.npy"
-        mask_p = out_dir / f"{sid}_msk.npy"
+        try:
+            img_raw  = np.array(Image.open(part_root / s["img_path_relative"]).convert("RGB"), dtype=np.uint8)
+            mask_raw = np.array(Image.open(part_root / s["mask_path_relative"]))
+            if mask_raw.dtype == bool:
+                mask_raw = mask_raw.astype(np.uint8) * 255
+            if mask_raw.ndim == 3:
+                mask_raw = mask_raw[:, :, 0]
+            mask_bin = (mask_raw > 127).astype(np.uint8)
 
-        if not img_p.exists():
-            try:
-                img_raw  = np.array(Image.open(part_root / s["img_path_relative"]).convert("RGB"))
-                mask_raw = np.array(Image.open(part_root / s["mask_path_relative"]))
-                if mask_raw.dtype == bool:
-                    mask_raw = mask_raw.astype(np.uint8) * 255
-                if mask_raw.ndim == 3:
-                    mask_raw = mask_raw[:, :, 0]
-                mask_bin = (mask_raw > 127).astype(np.float32)
-                np.save(str(img_p),  img_raw)
-                np.save(str(mask_p), mask_bin)
-            except Exception as e:
-                skipped += 1
-                if skipped <= 10:
-                    print(f"  [WARN] {sid}: {e}")
-                continue
+            records.append({
+                "img_np":    img_raw,
+                "mask_np":   mask_bin,
+                "sample_id": s["sample_id"],
+                "organ":     s.get("organ", s.get("dataset_name", "Unknown")),
+            })
+        except Exception as e:
+            skipped += 1
+            if skipped <= 5:
+                print(f"  [WARN] {s['sample_id']}: {e}")
+            continue
 
-        records.append({
-            "img_path":  str(img_p),
-            "mask_path": str(mask_p),
-            "sample_id": sid,
-            "organ":     s.get("organ", s.get("dataset_name", "Unknown")),
-        })
-
-        if (idx + 1) % 500 == 0:
+        if (idx + 1) % 1000 == 0:
             elapsed = time.time() - t0
             eta = elapsed / (idx + 1) * (total - idx - 1)
-            print(f"  [{idx+1}/{total}]  elapsed={format_time(elapsed)}  ETA={format_time(eta)}")
+            print(f"  [{idx+1}/{total}] loaded to RAM | elapsed={format_time(elapsed)}  ETA={format_time(eta)}")
 
     elapsed = time.time() - t0
-    print(f"  ✅ image_seg: {len(records)} records in {format_time(elapsed)} (skipped={skipped})")
+    print(f"  ✅ Loaded {len(records)} image_seg records to RAM in {format_time(elapsed)} (skipped={skipped})")
     return records
 
 
-def preextract_ceus_seg(task_samples, train_root, val_root, preproc_dir):
-    """Extract middle frame from CEUS videos."""
-    out_dir = Path(preproc_dir) / "ceus_seg"
-    out_dir.mkdir(parents=True, exist_ok=True)
+def load_in_memory_ceus_seg(task_samples, train_root, val_root):
+    """Load middle frame of CEUS segmentations directly into RAM."""
     records = []
+    skipped = 0
+    t0 = time.time()
+    total = len(task_samples)
 
     for idx, s in enumerate(task_samples):
         part_root = get_partition_root(
             Path(train_root), Path(val_root) if val_root else None,
             s["data_partition_group"],
         )
-        sid = s["sample_id"]
-        img_p  = out_dir / f"{sid}_img.npy"
-        mask_p = out_dir / f"{sid}_msk.npy"
+        try:
+            video = np.load(part_root / s["input_path_relative"])  # (15,256,512,3)
+            mid   = video[video.shape[0] // 2].astype(np.uint8)    # (256,512,3)
 
-        if not img_p.exists():
-            try:
-                video = np.load(part_root / s["input_path_relative"])  # (15,256,512,3)
-                mid   = video[video.shape[0] // 2]                     # (256,512,3)
-                np.save(str(img_p), mid.astype(np.uint8))
+            npz   = np.load(part_root / s["annotation_path_relative"])
+            mask  = (npz["mask"] > 127).astype(np.uint8)           # (256,512)
 
-                npz   = np.load(part_root / s["annotation_path_relative"])
-                mask  = npz["mask"].astype(np.float32) / 255.0
-                np.save(str(mask_p), mask)
-            except Exception as e:
-                print(f"  [WARN] ceus_seg {sid}: {e}")
-                continue
+            records.append({
+                "img_np":    mid,
+                "mask_np":   mask,
+                "sample_id": s["sample_id"],
+                "organ":     s.get("organ", "Unknown"),
+            })
+        except Exception as e:
+            skipped += 1
+            continue
 
-        records.append({
-            "img_path":  str(img_p),
-            "mask_path": str(mask_p),
-            "sample_id": sid,
-            "organ":     s.get("organ", "Unknown"),
-        })
+        if (idx + 1) % 300 == 0:
+            print(f"  [{idx+1}/{total}] loaded to RAM")
 
-        if (idx + 1) % 200 == 0:
-            print(f"  ceus_seg [{idx+1}/{len(task_samples)}]")
-
-    print(f"  ✅ ceus_seg: {len(records)} records")
+    print(f"  ✅ Loaded {len(records)} ceus_seg records to RAM (skipped={skipped})")
     return records
 
 
-def preextract_video_seg(task_samples, train_root, val_root, preproc_dir):
-    """Extract annotated frames from cardiac videos."""
-    out_dir = Path(preproc_dir) / "video_seg"
-    out_dir.mkdir(parents=True, exist_ok=True)
+def load_in_memory_video_seg(task_samples, train_root, val_root):
+    """Load frames of video segmentations directly into RAM."""
     records = []
+    t0 = time.time()
+    total = len(task_samples)
 
     for idx, s in enumerate(task_samples):
         part_root = get_partition_root(
             Path(train_root), Path(val_root) if val_root else None,
             s["data_partition_group"],
         )
-        sid = s["sample_id"]
-
         try:
             npz       = np.load(part_root / s["annotation_path_relative"], allow_pickle=True)
             fnum_mask = npz["fnum_mask"].item()
@@ -261,34 +236,27 @@ def preextract_video_seg(task_samples, train_root, val_root, preproc_dir):
 
             for frame_key, mask_arr in fnum_mask.items():
                 fidx  = int(frame_key)
-                img_p  = out_dir / f"{sid}_f{fidx}_img.npy"
-                mask_p = out_dir / f"{sid}_f{fidx}_msk.npy"
-
-                if not img_p.exists():
-                    if video is None:
-                        video = np.load(part_root / s["input_path_relative"])
-                    frame = video[0, fidx]  # (256,256) float
-                    frame_u8 = np.clip(frame, 0, 255).astype(np.uint8)
-                    frame_3ch = np.stack([frame_u8, frame_u8, frame_u8], axis=-1)
-                    mask_bin = (mask_arr / 255.0).clip(0, 1).astype(np.float32)
-                    np.save(str(img_p),  frame_3ch)
-                    np.save(str(mask_p), mask_bin)
+                if video is None:
+                    video = np.load(part_root / s["input_path_relative"])
+                frame = video[0, fidx]  # (256,256) float
+                frame_u8 = np.clip(frame, 0, 255).astype(np.uint8)
+                frame_3ch = np.stack([frame_u8, frame_u8, frame_u8], axis=-1)
+                mask_bin = (mask_arr > 127).astype(np.uint8)
 
                 records.append({
-                    "img_path":  str(img_p),
-                    "mask_path": str(mask_p),
-                    "sample_id": sid,
+                    "img_np":    frame_3ch,
+                    "mask_np":   mask_bin,
+                    "sample_id": s["sample_id"],
                     "organ":     s.get("organ", "Cardiac"),
                 })
-
             del video
         except Exception as e:
-            print(f"  [WARN] video_seg {sid}: {e}")
+            continue
 
-        if (idx + 1) % 200 == 0:
-            print(f"  video_seg [{idx+1}/{len(task_samples)}]")
+        if (idx + 1) % 300 == 0:
+            print(f"  [{idx+1}/{total}] loaded to RAM")
 
-    print(f"  ✅ video_seg: {len(records)} records")
+    print(f"  ✅ Loaded {len(records)} video_seg records to RAM")
     return records
 
 
@@ -343,16 +311,16 @@ for current_task in cfg["seg_tasks"]:
     train_aug = get_seg_train_transform(img_size)
     val_aug   = get_seg_val_transform(img_size)
 
-    # ── PRE-EXTRACTION ─────────────────────────────────────────
-    print(f"\n  📦 Pre-extracting {current_task} to .npy ...")
+    # ── IN-MEMORY LOAD ─────────────────────────────────────────
+    print(f"\n  📦 Loading {current_task} into memory...")
     t_pre = time.time()
     if current_task == "image_seg":
-        all_records = preextract_image_seg(task_samples, TRAIN, VAL_DIR, PREPROC)
+        all_records = load_in_memory_image_seg(task_samples, TRAIN, VAL_DIR)
     elif current_task == "ceus_seg":
-        all_records = preextract_ceus_seg(task_samples, TRAIN, VAL_DIR, PREPROC)
+        all_records = load_in_memory_ceus_seg(task_samples, TRAIN, VAL_DIR)
     elif current_task == "video_seg":
-        all_records = preextract_video_seg(task_samples, TRAIN, VAL_DIR, PREPROC)
-    print(f"  Pre-extraction: {format_time(time.time()-t_pre)}")
+        all_records = load_in_memory_video_seg(task_samples, TRAIN, VAL_DIR)
+    print(f"  Load complete: {format_time(time.time()-t_pre)}")
 
     # For video_seg: split by sample_id to avoid leakage
     if current_task == "video_seg":
@@ -368,18 +336,18 @@ for current_task in cfg["seg_tasks"]:
 
     print(f"  Train: {len(train_records)}  Val: {len(val_records)}")
 
-    # ── DataLoaders (workers prefetch .npy batches → GPU stays fed) ──
-    train_ds = FastNpySegDataset(train_records, train_aug)
-    val_ds   = FastNpySegDataset(val_records, val_aug)
+    # ── DataLoaders (workers prefetch batches → GPU stays fed) ──
+    train_ds = InMemorySegDataset(train_records, train_aug)
+    val_ds   = InMemorySegDataset(val_records, val_aug)
 
-    # Effective batch = batch_size * N_GPU (DataParallel doubles throughput)
     bs = cfg["batch_size"]
     nw = cfg["num_workers"]
+    pf = 2 if nw > 0 else None
     loader_kwargs = dict(
         num_workers=nw,
         pin_memory=cfg["pin_memory"],
         persistent_workers=(nw > 0),   # keep workers alive between epochs
-        prefetch_factor=4 if nw > 0 else None,  # prefetch 4 batches per worker
+        prefetch_factor=pf,            # prefetch 2 batches per worker
     )
     train_loader = DataLoader(
         train_ds, batch_size=bs, shuffle=True,
@@ -391,7 +359,7 @@ for current_task in cfg["seg_tasks"]:
     )
     print(f"  Train batches: {len(train_loader)}  Val batches: {len(val_loader)}")
     print(f"  Effective batch/step: {bs} × {max(N_GPU,1)} GPUs = {bs*max(N_GPU,1)}")
-    print(f"  Workers: {nw}  pin_memory: {cfg['pin_memory']}  prefetch: 4")
+    print(f"  Workers: {nw}  pin_memory: {cfg['pin_memory']}  prefetch: {pf}")
 
     # ── Model ─────────────────────────────────────────────────
     model = build_seg_model(cfg)
