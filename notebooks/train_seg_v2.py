@@ -226,10 +226,10 @@ for current_task in cfg["seg_tasks"]:
                 part_root = get_partition_root(
                     self.train_root, self.val_root, s["data_partition_group"],
                 )
-                img_path = part_root / s["input_path_relative"]
+                img_path = part_root / s["img_path_relative"]
                 img_np = np.array(Image.open(img_path).convert("RGB"))
 
-                ann_path = part_root / s["annotation_path_relative"]
+                ann_path = part_root / s["mask_path_relative"]
                 mask_raw = np.array(Image.open(ann_path))
                 if mask_raw.dtype == bool:
                     mask_raw = mask_raw.astype(np.uint8) * 255

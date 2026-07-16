@@ -109,7 +109,7 @@ if os.path.exists(ckpt_path):
     with torch.no_grad():
         for s in samples:
             part_root = get_partition_root(Path(TRAIN), Path(VAL_DIR), s["data_partition_group"])
-            img_path = part_root / s["input_path_relative"]
+            img_path = part_root / s["img_path_relative"]
             img = np.array(Image.open(img_path).convert("RGB"))
             img_t = transform(image=img)["image"].unsqueeze(0).to(DEVICE)
 
@@ -152,7 +152,7 @@ if os.path.exists(ckpt_path):
     with torch.no_grad():
         for s in samples:
             part_root = get_partition_root(Path(TRAIN), Path(VAL_DIR), s["data_partition_group"])
-            img_path = part_root / s["input_path_relative"]
+            img_path = part_root / s["img_path_relative"]
             img_pil = Image.open(img_path).convert("RGB")
             orig_w, orig_h = img_pil.size
 
@@ -168,9 +168,12 @@ if os.path.exists(ckpt_path):
                 (orig_w, orig_h), Image.BILINEAR))
             mask = (prob_resized > 127).astype(np.uint8) * 255
 
-            ann_rel = s["annotation_path_relative"]
-            out_path = Path(OUT) / ann_rel
-            out_path.parent.mkdir(parents=True, exist_ok=True)
+            target_name = s.get("target_name") or f"seg_mask_{count:05d}.png"
+            organ       = s["organ"]
+            dataset_nm  = s.get("dataset_name", organ)
+            out_dir     = Path(OUT) / "image_seg" / dataset_nm / "masks"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path    = out_dir / target_name
             Image.fromarray(mask, mode="L").save(str(out_path))
             count += 1
             if count % 200 == 0:
@@ -270,9 +273,11 @@ if os.path.exists(ckpt_path):
                 (orig_w, orig_h), Image.BILINEAR))
             mask = (prob_resized > 127).astype(np.uint8) * 255
 
-            ann_rel = s["annotation_path_relative"]
-            out_path = Path(OUT) / ann_rel
-            out_path.parent.mkdir(parents=True, exist_ok=True)
+            target_name = s.get("target_name") or f"seg_annotation_{count:05d}.npz"
+            dataset_nm  = s.get("dataset_name", s["organ"])
+            out_dir     = Path(OUT) / "ceus_seg" / dataset_nm / "annotations"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path    = out_dir / target_name
             np.savez(str(out_path), mask=mask)
             count += 1
             if count % 100 == 0:
@@ -331,9 +336,11 @@ if os.path.exists(ckpt_path):
 
                 fnum_mask[str(t)] = mask
 
-            ann_rel = s["annotation_path_relative"]
-            out_path = Path(OUT) / ann_rel
-            out_path.parent.mkdir(parents=True, exist_ok=True)
+            target_name = s.get("target_name") or f"seg_annotation_{count:05d}.npz"
+            dataset_nm  = s.get("dataset_name", s["organ"])
+            out_dir     = Path(OUT) / "video_seg" / dataset_nm / "annotations"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path    = out_dir / target_name
             np.savez(str(out_path), fnum_mask=fnum_mask)
             count += 1
             if count % 20 == 0:
