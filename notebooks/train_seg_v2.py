@@ -124,7 +124,7 @@ class InMemorySegDataset(Dataset):
             img_t  = torch.tensor(img_np).permute(2, 0, 1).float() / 255.0
             mask_t = torch.tensor(mask_np).float()
 
-        mask_t = mask_t.unsqueeze(0)  # (1, H, W)
+        mask_t = mask_t.unsqueeze(0).float()  # (1, H, W) float32
         dist_t = torch.zeros_like(mask_t)  # unused (no boundary loss)
 
         return {
