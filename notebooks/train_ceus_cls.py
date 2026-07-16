@@ -260,3 +260,16 @@ print(f"✅ CEUS CLS TRAINING COMPLETE")
 print(f"   Best val accuracy : {best_val_acc:.4f}")
 print(f"   Checkpoint saved  : {CKPT_DIR}/ceus_cls_best.pth")
 print(f"{'='*50}")
+
+# ── Clean up variables to free memory for subsequent runs ─────
+del model
+del optimizer
+del train_loader
+del val_loader
+del train_ds
+del val_ds
+import gc
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+

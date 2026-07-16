@@ -2,21 +2,16 @@
 notebooks/train_video_seg.py
 Phase A — Cardiac Video Segmentation Training (video_seg task).
 
-Flattens all annotated frames into individual 2D segmentation samples,
-trains a frame-wise U-Net on them.
+Pre-extracts all annotated frames into individual 2D files to drastically
+reduce RAM usage and disk I/O, then trains a frame-wise U-Net.
 
 HOW TO RUN:
     TRAIN_PATH = "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN"
     VAL_PATH   = "/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL"
     exec(open('/kaggle/working/repo/notebooks/train_video_seg.py').read())
-
-DATA:  video_seg — (3, T, 256, 256) float32 [0,255] .npy + fnum_mask .npz
-       CAMUS: 500 patients x 3 views, ~5 annotated frames each
-       CardiacCH: ~69 videos, 3-5 annotated frames each
-MODEL: SegModel (U-Net with ResNet-50 encoder) on single frames
 """
 
-import sys, os, json, random, time
+import sys, os, json, random, time, shutil
 from collections import defaultdict
 import numpy as np
 import torch
@@ -35,7 +30,7 @@ for mod in list(sys.modules.keys()):
 TRAIN   = globals().get("TRAIN_PATH", "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN")
 VAL_DIR = globals().get("VAL_PATH",   "/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL")
 
-BATCH_SIZE   = 96
+BATCH_SIZE   = 32
 EPOCHS       = 20
 LR           = 1e-4
 WEIGHT_DECAY = 1e-4
@@ -73,21 +68,15 @@ for jp in [PRIVATE_GT, PUBLIC_GT]:
 video_seg_samples = [s for s in all_samples if s["task"] == "video_seg"]
 print(f"Total video_seg video samples: {len(video_seg_samples)}")
 
-organ_counts = defaultdict(int)
-for s in video_seg_samples:
-    ds = s.get("dataset_name", s["organ"])
-    organ_counts[ds] += 1
-print("Per-dataset counts:")
-for ds, cnt in sorted(organ_counts.items()):
-    print(f"  {ds:20s}: {cnt}")
+# ── Pre-extract frames to disk to optimize RAM/IO ──────────────
+PREPROCESS_DIR = Path("/kaggle/working/preprocessed_video_seg")
+PREPROCESS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── Flatten into per-frame samples ────────────────────────────
-# Each video has multiple annotated frames. We flatten them into
-# individual (frame_image, frame_mask) pairs for training.
-print("\nFlattening annotated frames...")
-frame_samples = []   # list of (video_sample_dict, frame_index_str)
+frame_samples = []   # list of dicts: {"img_path": str, "mask_path": str, "sample_id": str}
 
-for s in video_seg_samples:
+print("\nPre-extracting annotated frames to local workspace (reduces I/O and RAM)...")
+t_start = time.time()
+for idx, s in enumerate(video_seg_samples):
     part_root = get_partition_root(Path(TRAIN), Path(VAL_DIR) if VAL_DIR else None,
                                    s["data_partition_group"])
     ann_path = part_root / s["annotation_path_relative"]
@@ -95,54 +84,63 @@ for s in video_seg_samples:
         try:
             npz = np.load(ann_path, allow_pickle=True)
             fnum_mask = npz["fnum_mask"].item()
-            for frame_key in fnum_mask.keys():
-                frame_samples.append((s, frame_key))
+            
+            # Only load video once for all its annotated frames
+            npy_path = part_root / s["input_path_relative"]
+            video = None
+            
+            for frame_key, mask_arr in fnum_mask.items():
+                frame_idx = int(frame_key)
+                sample_id = s["sample_id"]
+                
+                img_save_path = PREPROCESS_DIR / f"{sample_id}_f{frame_idx}_img.npy"
+                mask_save_path = PREPROCESS_DIR / f"{sample_id}_f{frame_idx}_mask.npy"
+                
+                # Check if already preprocessed
+                if not img_save_path.exists() or not mask_save_path.exists():
+                    if video is None:
+                        video = np.load(npy_path) # (3, T, 256, 256) float32
+                    
+                    frame = video[0, frame_idx]  # (256, 256)
+                    mask = (mask_arr / 255.0).clip(0, 1).astype(np.float32)
+                    
+                    np.save(img_save_path, frame.astype(np.float32))
+                    np.save(mask_save_path, mask)
+                
+                frame_samples.append({
+                    "img_path": str(img_save_path),
+                    "mask_path": str(mask_save_path),
+                    "sample_id": sample_id
+                })
         except Exception as e:
-            print(f"  Warning: Could not load {ann_path}: {e}")
+            print(f"  Warning: Could not preprocess {ann_path}: {e}")
+            
+    if (idx + 1) % 100 == 0:
+        print(f"  Preprocessed {idx + 1}/{len(video_seg_samples)} videos...")
 
-print(f"Total annotated frames (flattened): {len(frame_samples)}")
+print(f"Pre-extraction complete in {time.time() - t_start:.1f}s. Total frames: {len(frame_samples)}")
 
 # ── Custom Dataset ────────────────────────────────────────────
 NORMALIZE = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
 class VideoSegFrameDataset(Dataset):
-    """Each item is a single annotated frame from a cardiac video."""
-
-    def __init__(self, frame_list, train_root, val_root, augment=False):
+    def __init__(self, frame_list, augment=False):
         self.frame_list = frame_list
-        self.train_root = Path(train_root)
-        self.val_root = Path(val_root) if val_root else None
         self.augment = augment
 
     def __len__(self):
         return len(self.frame_list)
 
     def __getitem__(self, idx):
-        s, frame_key = self.frame_list[idx]
-        frame_idx = int(frame_key)
-
-        part_root = get_partition_root(self.train_root, self.val_root,
-                                       s["data_partition_group"])
-
-        # Load video: (3, T, 256, 256) float32 [0, 255]
-        npy_path = part_root / s["input_path_relative"]
-        video = np.load(npy_path)    # (3, T, 256, 256)
-
-        # Extract frame from view 0 (first cardiac view)
-        # video shape: (3_views, T_frames, 256, 256)
-        frame = video[0, frame_idx]  # (256, 256) float32 [0, 255]
-        frame = frame / 255.0        # normalize to [0, 1]
-
-        # Convert grayscale to 3-channel for ImageNet pretrained encoder
+        item = self.frame_list[idx]
+        
+        # Load 2D files (extremely fast, low RAM)
+        frame = np.load(item["img_path"])   # (256, 256) float32 [0, 255]
+        mask = np.load(item["mask_path"])   # (256, 256) float32 {0.0, 1.0}
+        
+        frame = frame / 255.0
         frame_3ch = np.stack([frame, frame, frame], axis=0)  # (3, 256, 256)
         frame_t = torch.tensor(frame_3ch, dtype=torch.float32)
-
-        # Load mask for this frame
-        ann_path = part_root / s["annotation_path_relative"]
-        npz = np.load(ann_path, allow_pickle=True)
-        fnum_mask = npz["fnum_mask"].item()
-        mask_arr = fnum_mask[frame_key]        # (256, 256) float32 [0, 255]
-        mask = (mask_arr / 255.0).clip(0, 1)   # {0.0, 1.0}
         mask_t = torch.tensor(mask, dtype=torch.float32).unsqueeze(0)  # (1, 256, 256)
 
         # Augmentation
@@ -158,26 +156,25 @@ class VideoSegFrameDataset(Dataset):
         frame_t = NORMALIZE(frame_t)
 
         return {
-            "input": frame_t,   # (3, 256, 256)
-            "mask":  mask_t,    # (1, 256, 256)
+            "input": frame_t,
+            "mask":  mask_t,
         }
 
 # ── Train/Val split (by video, not by frame) ─────────────────
-# Split at the video level so frames from the same video don't leak
 random.seed(SEED)
-video_ids = list(set(s["sample_id"] for s, _ in frame_samples))
+video_ids = list(set(item["sample_id"] for item in frame_samples))
 random.shuffle(video_ids)
 n_val_vids = max(1, int(len(video_ids) * VAL_SPLIT))
 val_video_ids = set(video_ids[:n_val_vids])
 
-train_frames = [(s, fk) for s, fk in frame_samples if s["sample_id"] not in val_video_ids]
-val_frames   = [(s, fk) for s, fk in frame_samples if s["sample_id"] in val_video_ids]
+train_frames = [f for f in frame_samples if f["sample_id"] not in val_video_ids]
+val_frames   = [f for f in frame_samples if f["sample_id"] in val_video_ids]
 
 print(f"Train frames: {len(train_frames)}  Val frames: {len(val_frames)}")
 print(f"Train videos: {len(video_ids) - n_val_vids}  Val videos: {n_val_vids}")
 
-train_ds = VideoSegFrameDataset(train_frames, TRAIN, VAL_DIR, augment=True)
-val_ds   = VideoSegFrameDataset(val_frames,   TRAIN, VAL_DIR, augment=False)
+train_ds = VideoSegFrameDataset(train_frames, augment=True)
+val_ds   = VideoSegFrameDataset(val_frames,   augment=False)
 
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                           num_workers=4, pin_memory=True)
@@ -187,7 +184,6 @@ val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
 print(f"Train batches: {len(train_loader)}  Val batches: {len(val_loader)}")
 
 # ── Model ─────────────────────────────────────────────────────
-# Use SegModel directly (VideoSegModel is just a wrapper around SegModel)
 model = build_model("image_seg", pretrained=True)
 if torch.cuda.device_count() > 1:
     model = nn.DataParallel(model)
@@ -226,7 +222,6 @@ for epoch in range(1, EPOCHS + 1):
         optimizer.zero_grad()
         logits = model(imgs)                # (B, 1, H, W)
 
-        # Resize if encoder output size differs
         if logits.shape[2:] != masks.shape[2:]:
             logits = F.interpolate(logits, size=masks.shape[2:],
                                    mode="bilinear", align_corners=False)
@@ -297,3 +292,16 @@ print(f"✅ VIDEO SEG TRAINING COMPLETE")
 print(f"   Best val dice : {best_val_dice:.4f}")
 print(f"   Checkpoint    : {CKPT_DIR}/video_seg_best.pth")
 print(f"{'='*50}")
+
+# ── Clean up variables to free memory for subsequent runs ─────
+del model
+del optimizer
+del train_loader
+del val_loader
+del train_ds
+del val_ds
+import gc
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
