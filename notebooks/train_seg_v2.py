@@ -104,16 +104,17 @@ class FastNpySegDataset(Dataset):
         img_np  = np.load(r["img_path"])   # (H, W, 3) uint8
         mask_np = np.load(r["mask_path"])  # (H, W) float32 {0,1}
 
-        # Simple flips — fast CPU ops, no Albumentations overhead
+        # Simple flips — fast CPU ops
         if random.random() < 0.5:
-            img_np  = img_np[:, ::-1, :].copy()
-            mask_np = mask_np[:, ::-1].copy()
+            img_np  = img_np[:, ::-1, :]
+            mask_np = mask_np[:, ::-1]
         if random.random() < 0.2:
-            img_np  = img_np[::-1, :, :].copy()
-            mask_np = mask_np[::-1, :].copy()
+            img_np  = img_np[::-1, :, :]
+            mask_np = mask_np[::-1, :]
 
-        img_t  = torch.from_numpy(img_np.copy()).permute(2, 0, 1).float() / 255.0
-        mask_t = torch.from_numpy(mask_np).unsqueeze(0).float()
+        # torch.tensor() always copies — safe for DataLoader workers
+        img_t  = torch.tensor(np.ascontiguousarray(img_np), dtype=torch.float32).permute(2, 0, 1) / 255.0
+        mask_t = torch.tensor(np.ascontiguousarray(mask_np), dtype=torch.float32).unsqueeze(0)
 
         return {
             "input": img_t,
@@ -134,8 +135,9 @@ class ValNpySegDataset(Dataset):
         r = self.records[idx]
         img_np  = np.load(r["img_path"])
         mask_np = np.load(r["mask_path"])
-        img_t  = torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
-        mask_t = torch.from_numpy(mask_np).unsqueeze(0).float()
+        # torch.tensor() always copies — safe for DataLoader workers
+        img_t  = torch.tensor(np.ascontiguousarray(img_np), dtype=torch.float32).permute(2, 0, 1) / 255.0
+        mask_t = torch.tensor(np.ascontiguousarray(mask_np), dtype=torch.float32).unsqueeze(0)
         return {
             "input": img_t,
             "mask":  mask_t,
