@@ -35,6 +35,69 @@ for mod in list(sys.modules.keys()):
     if mod.startswith("src"):
         del sys.modules[mod]
 
+import torchvision.transforms.functional as TF
+
+def apply_gpu_augmentations(imgs, masks):
+    """
+    Apply fast batch-wise augmentations directly on GPU.
+    imgs: (B, 3, H, W) float32 on GPU [0, 1]
+    masks: (B, 1, H, W) float32 on GPU {0, 1}
+    """
+    B, C, H, W = imgs.shape
+
+    # 1. Random Horizontal Flip (p=0.5)
+    if random.random() < 0.5:
+        imgs = torch.flip(imgs, dims=[-1])
+        masks = torch.flip(masks, dims=[-1])
+
+    # 2. Random Vertical Flip (p=0.2)
+    if random.random() < 0.2:
+        imgs = torch.flip(imgs, dims=[-2])
+        masks = torch.flip(masks, dims=[-2])
+
+    # 3. Random Affine (translation, scaling, rotation) (p=0.7)
+    if random.random() < 0.7:
+        angle = random.uniform(-30, 30)
+        tx = random.uniform(-0.1, 0.1) * W
+        ty = random.uniform(-0.1, 0.1) * H
+        scale = random.uniform(0.8, 1.2)
+        translate = [int(tx), int(ty)]
+        
+        imgs = TF.affine(imgs, angle=angle, translate=translate, scale=scale, shear=0.0, 
+                         interpolation=TF.InterpolationMode.BILINEAR)
+        masks = TF.affine(masks, angle=angle, translate=translate, scale=scale, shear=0.0, 
+                          interpolation=TF.InterpolationMode.NEAREST)
+
+    # 4. Color Jitter (Brightness/Contrast) (p=0.5)
+    if random.random() < 0.5:
+        brightness_factor = random.uniform(0.7, 1.3)
+        contrast_factor = random.uniform(0.7, 1.3)
+        imgs = TF.adjust_brightness(imgs, brightness_factor)
+        imgs = TF.adjust_contrast(imgs, contrast_factor)
+
+    # 5. Gaussian Noise / Speckle Noise (p=0.3)
+    if random.random() < 0.3:
+        noise = torch.randn_like(imgs) * random.uniform(0.01, 0.05)
+        imgs = torch.clamp(imgs + noise, 0.0, 1.0)
+
+    # 6. Coarse Dropout (Cutout) (p=0.3)
+    if random.random() < 0.3:
+        num_holes = random.randint(2, 6)
+        for _ in range(num_holes):
+            hh = random.randint(8, 32)
+            ww = random.randint(8, 32)
+            y = random.randint(0, H - hh)
+            x = random.randint(0, W - ww)
+            imgs[:, :, y:y+hh, x:x+ww] = 0.0
+
+    return imgs, masks
+
+def gpu_normalize(imgs):
+    """Normalize a batch of images on GPU using ImageNet mean/std."""
+    mean = torch.tensor([0.485, 0.456, 0.406], device=imgs.device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=imgs.device).view(1, 3, 1, 1)
+    return (imgs - mean) / std
+
 # ── Config ────────────────────────────────────────────────────
 from src.config import get_cfg, print_cfg
 cfg = get_cfg("seg")
@@ -46,8 +109,8 @@ if "VAL_PATH" in _gbl:
     cfg["val_root"] = _gbl["VAL_PATH"]
 
 cfg["seg_loss"] = "dice_focal"        # no boundary loss (no scipy)
-cfg["num_workers"] = 2                # 2 workers are optimal for in-memory dataset
-cfg["pin_memory"] = True              # faster host→device transfer
+cfg["num_workers"] = 0                # 0 workers is best for in-memory dataset + GPU augmentations (no leaks!)
+cfg["pin_memory"] = False             # not needed for num_workers=0
 cfg.update(_gbl.get("CFG_OVERRIDES", {}))
 
 os.makedirs(cfg["ckpt_dir"], exist_ok=True)
@@ -104,9 +167,8 @@ class InMemorySegDataset(Dataset):
     Reads image and mask arrays directly from RAM.
     Absolutely ZERO disk I/O during training.
     """
-    def __init__(self, records, transform):
+    def __init__(self, records):
         self.records = records
-        self.transform = transform
 
     def __len__(self):
         return len(self.records)
@@ -116,30 +178,22 @@ class InMemorySegDataset(Dataset):
         img_np  = r["img_np"]   # (H, W, 3) uint8
         mask_np = r["mask_np"]  # (H, W)    uint8 {0,1}
 
-        if self.transform:
-            out    = self.transform(image=img_np, mask=mask_np)
-            img_t  = out["image"]    # (3, H, W) float32
-            mask_t = out["mask"]     # (H, W)    float32
-        else:
-            img_t  = torch.tensor(img_np).permute(2, 0, 1).float() / 255.0
-            mask_t = torch.tensor(mask_np).float()
-
-        mask_t = mask_t.unsqueeze(0).float()  # (1, H, W) float32
-        dist_t = torch.zeros_like(mask_t)  # unused (no boundary loss)
+        img_t  = torch.from_numpy(img_np).permute(2, 0, 1)  # (3, H, W) uint8
+        mask_t = torch.from_numpy(mask_np).unsqueeze(0)     # (1, H, W) uint8
 
         return {
             "input":    img_t,
-            "mask":     mask_t,
-            "dist_map": dist_t,
+            "mask":     mask_t.float(),
+            "dist_map": torch.zeros_like(mask_t).float(),
             "organ":    r.get("organ", "Unknown"),
         }
 
 
 # ═══════════════════════════════════════════════════════════════
-#  IN-MEMORY LOAD FUNCTIONS
+#  IN-MEMORY LOAD FUNCTIONS (Resizing done once during load)
 # ═══════════════════════════════════════════════════════════════
-def load_in_memory_image_seg(task_samples, train_root, val_root):
-    """Load image_seg PNGs directly into RAM to save disk space and maximize speed."""
+def load_in_memory_image_seg(task_samples, train_root, val_root, target_size=(512, 512)):
+    """Load image_seg PNGs directly into RAM, resized to target_size to save RAM and maximize speed."""
     records = []
     skipped = 0
     t0 = time.time()
@@ -152,16 +206,24 @@ def load_in_memory_image_seg(task_samples, train_root, val_root):
             s["data_partition_group"],
         )
         try:
-            img_raw  = np.array(Image.open(part_root / s["img_path_relative"]).convert("RGB"), dtype=np.uint8)
-            mask_raw = np.array(Image.open(part_root / s["mask_path_relative"]))
-            if mask_raw.dtype == bool:
-                mask_raw = mask_raw.astype(np.uint8) * 255
-            if mask_raw.ndim == 3:
-                mask_raw = mask_raw[:, :, 0]
-            mask_bin = (mask_raw > 127).astype(np.uint8)
+            img_raw  = Image.open(part_root / s["img_path_relative"]).convert("RGB")
+            mask_raw = Image.open(part_root / s["mask_path_relative"])
+
+            if img_raw.size != target_size:
+                img_raw = img_raw.resize(target_size, Image.BILINEAR)
+            if mask_raw.size != target_size:
+                mask_raw = mask_raw.resize(target_size, Image.NEAREST)
+
+            img_np = np.array(img_raw, dtype=np.uint8)
+            mask_np = np.array(mask_raw)
+            if mask_np.dtype == bool:
+                mask_np = mask_np.astype(np.uint8) * 255
+            if mask_np.ndim == 3:
+                mask_np = mask_np[:, :, 0]
+            mask_bin = (mask_np > 127).astype(np.uint8)
 
             records.append({
-                "img_np":    img_raw,
+                "img_np":    img_np,
                 "mask_np":   mask_bin,
                 "sample_id": s["sample_id"],
                 "organ":     s.get("organ", s.get("dataset_name", "Unknown")),
@@ -182,8 +244,8 @@ def load_in_memory_image_seg(task_samples, train_root, val_root):
     return records
 
 
-def load_in_memory_ceus_seg(task_samples, train_root, val_root):
-    """Load middle frame of CEUS segmentations directly into RAM."""
+def load_in_memory_ceus_seg(task_samples, train_root, val_root, target_size=(512, 256)):
+    """Load middle frame of CEUS segmentations directly into RAM, resized to target_size."""
     records = []
     skipped = 0
     t0 = time.time()
@@ -200,6 +262,11 @@ def load_in_memory_ceus_seg(task_samples, train_root, val_root):
 
             npz   = np.load(part_root / s["annotation_path_relative"])
             mask  = (npz["mask"] > 127).astype(np.uint8)           # (256,512)
+
+            if (mid.shape[1], mid.shape[0]) != target_size:
+                mid = np.array(Image.fromarray(mid).resize(target_size, Image.BILINEAR), dtype=np.uint8)
+            if (mask.shape[1], mask.shape[0]) != target_size:
+                mask = np.array(Image.fromarray(mask).resize(target_size, Image.NEAREST), dtype=np.uint8)
 
             records.append({
                 "img_np":    mid,
@@ -218,8 +285,8 @@ def load_in_memory_ceus_seg(task_samples, train_root, val_root):
     return records
 
 
-def load_in_memory_video_seg(task_samples, train_root, val_root):
-    """Load frames of video segmentations directly into RAM."""
+def load_in_memory_video_seg(task_samples, train_root, val_root, target_size=(256, 256)):
+    """Load frames of video segmentations directly into RAM, resized to target_size."""
     records = []
     t0 = time.time()
     total = len(task_samples)
@@ -242,6 +309,11 @@ def load_in_memory_video_seg(task_samples, train_root, val_root):
                 frame_u8 = np.clip(frame, 0, 255).astype(np.uint8)
                 frame_3ch = np.stack([frame_u8, frame_u8, frame_u8], axis=-1)
                 mask_bin = (mask_arr > 127).astype(np.uint8)
+
+                if (frame_3ch.shape[1], frame_3ch.shape[0]) != target_size:
+                    frame_3ch = np.array(Image.fromarray(frame_3ch).resize(target_size, Image.BILINEAR), dtype=np.uint8)
+                if (mask_bin.shape[1], mask_bin.shape[0]) != target_size:
+                    mask_bin = np.array(Image.fromarray(mask_bin).resize(target_size, Image.NEAREST), dtype=np.uint8)
 
                 records.append({
                     "img_np":    frame_3ch,
@@ -308,18 +380,20 @@ for current_task in cfg["seg_tasks"]:
         img_size = cfg["img_size_seg"]
         cfg["ckpt_prefix"] = current_task
 
-    train_aug = get_seg_train_transform(img_size)
-    val_aug   = get_seg_val_transform(img_size)
+    if isinstance(img_size, (list, tuple)):
+        pil_size = (img_size[1], img_size[0])  # (width, height)
+    else:
+        pil_size = (img_size, img_size)
 
     # ── IN-MEMORY LOAD ─────────────────────────────────────────
-    print(f"\n  📦 Loading {current_task} into memory...")
+    print(f"\n  📦 Loading {current_task} into memory (resize to {pil_size[1]}x{pil_size[0]})...")
     t_pre = time.time()
     if current_task == "image_seg":
-        all_records = load_in_memory_image_seg(task_samples, TRAIN, VAL_DIR)
+        all_records = load_in_memory_image_seg(task_samples, TRAIN, VAL_DIR, target_size=pil_size)
     elif current_task == "ceus_seg":
-        all_records = load_in_memory_ceus_seg(task_samples, TRAIN, VAL_DIR)
+        all_records = load_in_memory_ceus_seg(task_samples, TRAIN, VAL_DIR, target_size=pil_size)
     elif current_task == "video_seg":
-        all_records = load_in_memory_video_seg(task_samples, TRAIN, VAL_DIR)
+        all_records = load_in_memory_video_seg(task_samples, TRAIN, VAL_DIR, target_size=pil_size)
     print(f"  Load complete: {format_time(time.time()-t_pre)}")
 
     # For video_seg: split by sample_id to avoid leakage
@@ -337,8 +411,8 @@ for current_task in cfg["seg_tasks"]:
     print(f"  Train: {len(train_records)}  Val: {len(val_records)}")
 
     # ── DataLoaders (workers prefetch batches → GPU stays fed) ──
-    train_ds = InMemorySegDataset(train_records, train_aug)
-    val_ds   = InMemorySegDataset(val_records, val_aug)
+    train_ds = InMemorySegDataset(train_records)
+    val_ds   = InMemorySegDataset(val_records)
 
     bs = cfg["batch_size"]
     nw = cfg["num_workers"]
@@ -395,8 +469,12 @@ for current_task in cfg["seg_tasks"]:
         optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(train_loader):
-            imgs     = batch["input"].to(DEVICE, non_blocking=True)
+            imgs     = batch["input"].to(DEVICE, non_blocking=True).float() / 255.0
             masks    = batch["mask"].to(DEVICE, non_blocking=True)
+
+            # Apply fast batch-wise augmentations directly on GPU
+            imgs, masks = apply_gpu_augmentations(imgs, masks)
+            imgs = gpu_normalize(imgs)
 
             with autocast("cuda", enabled=cfg["use_amp"]):
                 logits = model(imgs)
@@ -459,9 +537,11 @@ for current_task in cfg["seg_tasks"]:
 
         with torch.no_grad():
             for batch in val_loader:
-                imgs   = batch["input"].to(DEVICE, non_blocking=True)
+                imgs   = batch["input"].to(DEVICE, non_blocking=True).float() / 255.0
                 masks  = batch["mask"].to(DEVICE, non_blocking=True)
                 organs = batch["organ"]
+
+                imgs = gpu_normalize(imgs)
 
                 with autocast("cuda", enabled=cfg["use_amp"]):
                     logits = model(imgs)
