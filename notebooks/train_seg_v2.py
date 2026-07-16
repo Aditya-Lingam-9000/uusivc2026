@@ -92,19 +92,29 @@ print(f"Total training samples loaded: {len(all_samples)}")
 #  DATASET — reads pre-extracted .npy files from /tmp/
 # ═══════════════════════════════════════════════════════════════
 class FastNpySegDataset(Dataset):
-    """Reads (img.npy, mask.npy) pairs from disk. Fast np.load, zero RAM accumulation."""
-    def __init__(self, records):
+    """Reads .npy pairs, resizes to target shape, applies flips."""
+    def __init__(self, records, img_size):
         self.records = records
+        # img_size can be int (square) or (H, W) tuple
+        h, w = (img_size, img_size) if isinstance(img_size, int) else img_size[:2]
+        self.pil_size = (w, h)   # PIL wants (width, height)
+        self.tgt_hw   = (h, w)
 
     def __len__(self):
         return len(self.records)
 
     def __getitem__(self, idx):
         r = self.records[idx]
-        img_np  = np.load(r["img_path"])   # (H, W, 3) uint8
-        mask_np = np.load(r["mask_path"])  # (H, W) float32 {0,1}
+        img_np  = np.load(r["img_path"])   # (H', W', 3) uint8
+        mask_np = np.load(r["mask_path"])  # (H', W') float32
 
-        # Simple flips — fast CPU ops
+        # Resize to target if needed
+        if img_np.shape[0] != self.tgt_hw[0] or img_np.shape[1] != self.tgt_hw[1]:
+            img_np  = np.array(Image.fromarray(img_np).resize(self.pil_size, Image.BILINEAR), dtype=np.uint8)
+            m_u8    = (mask_np * 255).clip(0, 255).astype(np.uint8)
+            mask_np = (np.array(Image.fromarray(m_u8).resize(self.pil_size, Image.NEAREST)) > 127).astype(np.float32)
+
+        # Simple flips
         if random.random() < 0.5:
             img_np  = img_np[:, ::-1, :]
             mask_np = mask_np[:, ::-1]
@@ -112,21 +122,18 @@ class FastNpySegDataset(Dataset):
             img_np  = img_np[::-1, :, :]
             mask_np = mask_np[::-1, :]
 
-        # torch.tensor() always copies — safe for DataLoader workers
-        img_t  = torch.tensor(np.ascontiguousarray(img_np), dtype=torch.float32).permute(2, 0, 1) / 255.0
+        img_t  = torch.tensor(np.ascontiguousarray(img_np),  dtype=torch.float32).permute(2, 0, 1) / 255.0
         mask_t = torch.tensor(np.ascontiguousarray(mask_np), dtype=torch.float32).unsqueeze(0)
-
-        return {
-            "input": img_t,
-            "mask":  mask_t,
-            "organ": r.get("organ", "Unknown"),
-        }
+        return {"input": img_t, "mask": mask_t, "organ": r.get("organ", "Unknown")}
 
 
 class ValNpySegDataset(Dataset):
-    """Reads (img.npy, mask.npy) for validation — no augmentation."""
-    def __init__(self, records):
+    """Reads .npy pairs, resizes to target shape — no augmentation."""
+    def __init__(self, records, img_size):
         self.records = records
+        h, w = (img_size, img_size) if isinstance(img_size, int) else img_size[:2]
+        self.pil_size = (w, h)
+        self.tgt_hw   = (h, w)
 
     def __len__(self):
         return len(self.records)
@@ -135,14 +142,15 @@ class ValNpySegDataset(Dataset):
         r = self.records[idx]
         img_np  = np.load(r["img_path"])
         mask_np = np.load(r["mask_path"])
-        # torch.tensor() always copies — safe for DataLoader workers
-        img_t  = torch.tensor(np.ascontiguousarray(img_np), dtype=torch.float32).permute(2, 0, 1) / 255.0
+
+        if img_np.shape[0] != self.tgt_hw[0] or img_np.shape[1] != self.tgt_hw[1]:
+            img_np  = np.array(Image.fromarray(img_np).resize(self.pil_size, Image.BILINEAR), dtype=np.uint8)
+            m_u8    = (mask_np * 255).clip(0, 255).astype(np.uint8)
+            mask_np = (np.array(Image.fromarray(m_u8).resize(self.pil_size, Image.NEAREST)) > 127).astype(np.float32)
+
+        img_t  = torch.tensor(np.ascontiguousarray(img_np),  dtype=torch.float32).permute(2, 0, 1) / 255.0
         mask_t = torch.tensor(np.ascontiguousarray(mask_np), dtype=torch.float32).unsqueeze(0)
-        return {
-            "input": img_t,
-            "mask":  mask_t,
-            "organ": r.get("organ", "Unknown"),
-        }
+        return {"input": img_t, "mask": mask_t, "organ": r.get("organ", "Unknown")}
 
 
 # ── GPU-native normalization (fast, no CPU sync) ───────────────
@@ -320,11 +328,17 @@ for current_task in cfg["seg_tasks"]:
         continue
 
     if current_task == "image_seg":
+        img_size = cfg["img_size_seg"]         # 512
         cfg["ckpt_prefix"] = "image_seg"
     elif current_task == "ceus_seg":
+        img_size = cfg["img_size_ceus_seg"]    # (256, 512) H x W
         cfg["ckpt_prefix"] = "ceus_seg"
     elif current_task == "video_seg":
+        img_size = cfg["img_size_video_seg"]   # 256
         cfg["ckpt_prefix"] = "video_seg"
+    else:
+        img_size = cfg["img_size_seg"]
+        cfg["ckpt_prefix"] = current_task
 
     # ── Pre-extract to /tmp/ ───────────────────────────────────
     print(f"\n  📦 Pre-extracting {current_task} → {PREPROC}  (57GB /tmp/ disk)")
@@ -353,8 +367,8 @@ for current_task in cfg["seg_tasks"]:
     # ── DataLoaders ────────────────────────────────────────────
     bs = cfg["batch_size"]
     nw = cfg["num_workers"]
-    train_ds = FastNpySegDataset(train_records)
-    val_ds   = ValNpySegDataset(val_records)
+    train_ds = FastNpySegDataset(train_records, img_size)
+    val_ds   = ValNpySegDataset(val_records,   img_size)
     train_loader = DataLoader(
         train_ds, batch_size=bs, shuffle=True, drop_last=True,
         num_workers=nw, pin_memory=cfg["pin_memory"],
