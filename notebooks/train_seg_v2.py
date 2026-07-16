@@ -44,7 +44,7 @@ if "VAL_PATH" in _gbl:
 
 # Use /tmp/ for pre-extracted .npy files — it has 57.6 GB disk space on Kaggle
 # This avoids filling the 19.5 GB /kaggle/working/ limit
-cfg["preprocess_dir"] = "/tmp/preprocessed"
+cfg["preprocess_dir"] = "/tmp/preprocessed_resized"  # new dir — images stored at target size
 cfg["seg_loss"] = "dice_focal"        # no boundary loss (no scipy)
 cfg["num_workers"] = 2                # 2 workers prefetch while GPU computes
 cfg["pin_memory"] = True              # faster CPU→GPU transfer
@@ -105,16 +105,10 @@ class FastNpySegDataset(Dataset):
 
     def __getitem__(self, idx):
         r = self.records[idx]
-        img_np  = np.load(r["img_path"])   # (H', W', 3) uint8
-        mask_np = np.load(r["mask_path"])  # (H', W') float32
+        # Files are already resized to target — just load + flip (zero PIL overhead)
+        img_np  = np.load(r["img_path"])   # (H, W, 3) uint8
+        mask_np = np.load(r["mask_path"])  # (H, W) float32
 
-        # Resize to target if needed
-        if img_np.shape[0] != self.tgt_hw[0] or img_np.shape[1] != self.tgt_hw[1]:
-            img_np  = np.array(Image.fromarray(img_np).resize(self.pil_size, Image.BILINEAR), dtype=np.uint8)
-            m_u8    = (mask_np * 255).clip(0, 255).astype(np.uint8)
-            mask_np = (np.array(Image.fromarray(m_u8).resize(self.pil_size, Image.NEAREST)) > 127).astype(np.float32)
-
-        # Simple flips
         if random.random() < 0.5:
             img_np  = img_np[:, ::-1, :]
             mask_np = mask_np[:, ::-1]
@@ -142,12 +136,6 @@ class ValNpySegDataset(Dataset):
         r = self.records[idx]
         img_np  = np.load(r["img_path"])
         mask_np = np.load(r["mask_path"])
-
-        if img_np.shape[0] != self.tgt_hw[0] or img_np.shape[1] != self.tgt_hw[1]:
-            img_np  = np.array(Image.fromarray(img_np).resize(self.pil_size, Image.BILINEAR), dtype=np.uint8)
-            m_u8    = (mask_np * 255).clip(0, 255).astype(np.uint8)
-            mask_np = (np.array(Image.fromarray(m_u8).resize(self.pil_size, Image.NEAREST)) > 127).astype(np.float32)
-
         img_t  = torch.tensor(np.ascontiguousarray(img_np),  dtype=torch.float32).permute(2, 0, 1) / 255.0
         mask_t = torch.tensor(np.ascontiguousarray(mask_np), dtype=torch.float32).unsqueeze(0)
         return {"input": img_t, "mask": mask_t, "organ": r.get("organ", "Unknown")}
@@ -168,7 +156,8 @@ def gpu_normalize(imgs):
 # ═══════════════════════════════════════════════════════════════
 #  PRE-EXTRACTION → /tmp/preprocessed/  (57 GB disk, safe!)
 # ═══════════════════════════════════════════════════════════════
-def preextract_image_seg(task_samples, train_root, val_root, preproc_dir):
+def preextract_image_seg(task_samples, train_root, val_root, preproc_dir, pil_size):
+    """Extract and RESIZE to pil_size=(W,H) — workers never PIL resize again."""
     out_dir = Path(preproc_dir) / "image_seg"
     out_dir.mkdir(parents=True, exist_ok=True)
     records, skipped = [], 0
@@ -185,14 +174,21 @@ def preextract_image_seg(task_samples, train_root, val_root, preproc_dir):
 
         if not img_p.exists():
             try:
-                img_raw  = np.array(Image.open(part_root / s["img_path_relative"]).convert("RGB"), dtype=np.uint8)
-                mask_raw = np.array(Image.open(part_root / s["mask_path_relative"]))
+                img_pil  = Image.open(part_root / s["img_path_relative"]).convert("RGB")
+                if img_pil.size != pil_size:
+                    img_pil = img_pil.resize(pil_size, Image.BILINEAR)
+                img_raw  = np.array(img_pil, dtype=np.uint8)
+
+                msk_pil  = Image.open(part_root / s["mask_path_relative"])
+                if msk_pil.size != pil_size:
+                    msk_pil = msk_pil.resize(pil_size, Image.NEAREST)
+                mask_raw = np.array(msk_pil)
                 if mask_raw.dtype == bool:
                     mask_raw = mask_raw.astype(np.uint8) * 255
                 if mask_raw.ndim == 3:
                     mask_raw = mask_raw[:, :, 0]
                 mask_bin = (mask_raw > 127).astype(np.float32)
-                np.save(str(img_p),  img_raw)
+                np.save(str(img_p), img_raw)
                 np.save(str(msk_p), mask_bin)
             except Exception as e:
                 skipped += 1
@@ -200,12 +196,8 @@ def preextract_image_seg(task_samples, train_root, val_root, preproc_dir):
                     print(f"  [WARN] {sid}: {e}")
                 continue
 
-        records.append({
-            "img_path":  str(img_p),
-            "mask_path": str(msk_p),
-            "sample_id": sid,
-            "organ":     s.get("organ", s.get("dataset_name", "Unknown")),
-        })
+        records.append({"img_path": str(img_p), "mask_path": str(msk_p),
+                         "sample_id": sid, "organ": s.get("organ", s.get("dataset_name", "Unknown"))})
         if (idx + 1) % 500 == 0:
             el = time.time() - t0
             eta = el / (idx + 1) * (total - idx - 1)
@@ -215,7 +207,7 @@ def preextract_image_seg(task_samples, train_root, val_root, preproc_dir):
     return records
 
 
-def preextract_ceus_seg(task_samples, train_root, val_root, preproc_dir):
+def preextract_ceus_seg(task_samples, train_root, val_root, preproc_dir, pil_size):
     out_dir = Path(preproc_dir) / "ceus_seg"
     out_dir.mkdir(parents=True, exist_ok=True)
     records, skipped = [], 0
@@ -231,22 +223,25 @@ def preextract_ceus_seg(task_samples, train_root, val_root, preproc_dir):
 
         if not img_p.exists():
             try:
-                video = np.load(part_root / s["input_path_relative"])
-                mid   = video[video.shape[0] // 2].astype(np.uint8)
-                np.save(str(img_p), mid)
-                npz  = np.load(part_root / s["annotation_path_relative"])
-                mask = (npz["mask"] > 127).astype(np.float32)
-                np.save(str(msk_p), mask)
-            except Exception as e:
+                video   = np.load(part_root / s["input_path_relative"])
+                mid     = video[video.shape[0] // 2].astype(np.uint8)
+                mid_pil = Image.fromarray(mid)
+                if mid_pil.size != pil_size:
+                    mid_pil = mid_pil.resize(pil_size, Image.BILINEAR)
+                np.save(str(img_p), np.array(mid_pil, dtype=np.uint8))
+
+                npz     = np.load(part_root / s["annotation_path_relative"])
+                mask    = (npz["mask"] > 127).astype(np.uint8)
+                msk_pil = Image.fromarray(mask * 255)
+                if msk_pil.size != pil_size:
+                    msk_pil = msk_pil.resize(pil_size, Image.NEAREST)
+                np.save(str(msk_p), (np.array(msk_pil) > 127).astype(np.float32))
+            except Exception:
                 skipped += 1
                 continue
 
-        records.append({
-            "img_path":  str(img_p),
-            "mask_path": str(msk_p),
-            "sample_id": sid,
-            "organ":     s.get("organ", "Unknown"),
-        })
+        records.append({"img_path": str(img_p), "mask_path": str(msk_p),
+                         "sample_id": sid, "organ": s.get("organ", "Unknown")})
         if (idx + 1) % 200 == 0:
             print(f"  ceus_seg [{idx+1}/{len(task_samples)}]")
 
@@ -254,7 +249,7 @@ def preextract_ceus_seg(task_samples, train_root, val_root, preproc_dir):
     return records
 
 
-def preextract_video_seg(task_samples, train_root, val_root, preproc_dir):
+def preextract_video_seg(task_samples, train_root, val_root, preproc_dir, pil_size):
     out_dir = Path(preproc_dir) / "video_seg"
     out_dir.mkdir(parents=True, exist_ok=True)
     records = []
@@ -279,15 +274,17 @@ def preextract_video_seg(task_samples, train_root, val_root, preproc_dir):
                     frame    = video[0, fidx]
                     frame_u8 = np.clip(frame, 0, 255).astype(np.uint8)
                     frame_3  = np.stack([frame_u8] * 3, axis=-1)
-                    msk_bin  = (mask_arr > 127).astype(np.float32)
-                    np.save(str(img_p), frame_3)
-                    np.save(str(msk_p), msk_bin)
-                records.append({
-                    "img_path":  str(img_p),
-                    "mask_path": str(msk_p),
-                    "sample_id": sid,
-                    "organ":     s.get("organ", "Cardiac"),
-                })
+                    frm_pil  = Image.fromarray(frame_3)
+                    if frm_pil.size != pil_size:
+                        frm_pil = frm_pil.resize(pil_size, Image.BILINEAR)
+                    msk_u8   = (mask_arr > 127).astype(np.uint8)
+                    msk_pil  = Image.fromarray(msk_u8 * 255)
+                    if msk_pil.size != pil_size:
+                        msk_pil = msk_pil.resize(pil_size, Image.NEAREST)
+                    np.save(str(img_p), np.array(frm_pil, dtype=np.uint8))
+                    np.save(str(msk_p), (np.array(msk_pil) > 127).astype(np.float32))
+                records.append({"img_path": str(img_p), "mask_path": str(msk_p),
+                                 "sample_id": sid, "organ": s.get("organ", "Cardiac")})
             del video
         except Exception:
             pass
@@ -340,15 +337,21 @@ for current_task in cfg["seg_tasks"]:
         img_size = cfg["img_size_seg"]
         cfg["ckpt_prefix"] = current_task
 
-    # ── Pre-extract to /tmp/ ───────────────────────────────────
-    print(f"\n  📦 Pre-extracting {current_task} → {PREPROC}  (57GB /tmp/ disk)")
+    # Compute PIL size (W, H) from img_size (H or (H,W))
+    if isinstance(img_size, int):
+        pil_size = (img_size, img_size)
+    else:
+        pil_size = (img_size[1], img_size[0])   # PIL wants (width, height)
+
+    # ── Pre-extract to /tmp/preprocessed_resized/ ──────────────
+    print(f"\n  📦 Pre-extracting {current_task} → {PREPROC}  (resize to {pil_size})")
     t_pre = time.time()
     if current_task == "image_seg":
-        all_records = preextract_image_seg(task_samples, TRAIN, VAL_DIR, PREPROC)
+        all_records = preextract_image_seg(task_samples, TRAIN, VAL_DIR, PREPROC, pil_size)
     elif current_task == "ceus_seg":
-        all_records = preextract_ceus_seg(task_samples, TRAIN, VAL_DIR, PREPROC)
+        all_records = preextract_ceus_seg(task_samples, TRAIN, VAL_DIR, PREPROC, pil_size)
     elif current_task == "video_seg":
-        all_records = preextract_video_seg(task_samples, TRAIN, VAL_DIR, PREPROC)
+        all_records = preextract_video_seg(task_samples, TRAIN, VAL_DIR, PREPROC, pil_size)
     print(f"  Pre-extraction: {format_time(time.time() - t_pre)}")
 
     if current_task == "video_seg":
