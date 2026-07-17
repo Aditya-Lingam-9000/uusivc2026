@@ -306,6 +306,16 @@ class Trainer:
                     f"  |  ETA_total: {fmt_time(eta_total)}"
                     f"{vram_str}"
                 )
+                gc.collect()
+
+            # ── Free memory per batch ──────────────────────────────
+            del batch
+            if 'imgs' in locals(): del imgs
+            if 'masks' in locals(): del masks
+            if 'labels' in locals(): del labels
+            if 'logits' in locals(): del logits
+            if 'loss' in locals(): del loss
+            if 'loss_out' in locals(): del loss_out
 
         return {
             "loss":   loss_sum / max(n_samples, 1),
@@ -355,6 +365,14 @@ class Trainer:
                 loss_sum   += loss.item() * bs
                 metric_sum += metric_val * bs
                 n_samples  += bs
+
+                del batch
+                if 'imgs' in locals(): del imgs
+                if 'masks' in locals(): del masks
+                if 'labels' in locals(): del labels
+                if 'logits' in locals(): del logits
+                if 'loss' in locals(): del loss
+                if 'loss_out' in locals(): del loss_out
 
         return {
             "loss":   loss_sum / max(n_samples, 1),

@@ -182,10 +182,10 @@ class CEUSSegDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.sample_list[idx]
-        img_np   = np.load(item["img_path"], mmap_mode='r')     # (256, 512, 3) uint8
-        mask_raw = np.load(item["mask_path"], mmap_mode='r')    # (256, 512) uint8
+        img_np   = np.load(item["img_path"])     # (256, 512, 3) uint8
+        mask_raw = np.load(item["mask_path"])    # (256, 512) uint8
 
-        img_t, mask_t = apply_seg_transform(self.transform, img_np.copy(), mask_raw.copy())
+        img_t, mask_t = apply_seg_transform(self.transform, img_np, mask_raw)
         return {"input": img_t, "mask": mask_t, "organ": item["organ"]}
 
 

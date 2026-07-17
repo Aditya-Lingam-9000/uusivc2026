@@ -190,9 +190,9 @@ class CEUSClsDataset(Dataset):
 
     def __getitem__(self, idx):
         item   = self.sample_list[idx]
-        frames = np.load(item["frames_path"], mmap_mode='r')           # (16,256,512,3) uint8
-        # Copy to memory to avoid memory-map index overhead on CPU during permute/division
-        frames_t = torch.tensor(frames.copy()).permute(0, 3, 1, 2).float() / 255.0  # (16,3,256,512)
+        frames = np.load(item["frames_path"])           # (16,256,512,3) uint8
+        # Use direct torch creation
+        frames_t = torch.from_numpy(frames).permute(0, 3, 1, 2).float() / 255.0  # (16,3,256,512)
         return {
             "input": frames_t,
             "label": torch.tensor(item["label"], dtype=torch.long),
@@ -331,7 +331,7 @@ warmup_e   = CFG.get("warmup_epochs", 5)
 print(f"\n{'='*65}")
 print(f"  {CKPT_PREFIX}  |  epochs {start_epoch}→{epochs}")
 print(f"  AMP={CFG['use_amp']}  |  EffBatch={CFG['batch_size']*accum_steps}")
-print(f"  Workers={NW}  |  persistent_workers=False  |  prefetch=2")
+print(f"  Workers=0  |  persistent_workers=False  |  prefetch=0")
 print(f"  VRAM at start: {fmt_vram()}")
 print(f"{'='*65}\n")
 
@@ -396,7 +396,11 @@ for epoch in range(start_epoch, epochs + 1):
                   f"loss={loss_sum/max(total,1):.4f}  acc={correct/max(total,1):.4f}  "
                   f"|  LR:{lr_s}  |  ETA_epoch:{fmt_time(eta_e)}  "
                   f"|  ETA_total:{fmt_time(eta_t)}  |  VRAM:{fmt_vram()}")
+            gc.collect()
 
+        # ── Aggressive memory free per batch ────────────────────
+        del batch, imgs, labels, logits, loss
+        
     scheduler.step(epoch)
     train_loss = loss_sum / max(total, 1)
     train_acc  = correct / max(total, 1)
@@ -420,6 +424,9 @@ for epoch in range(start_epoch, epochs + 1):
             for i, org in enumerate(batch["organ"]):
                 org_t[org] += 1
                 org_c[org] += mask[i].item()
+            
+            # ── Free memory in validation loop ───────────
+            del batch, imgs, labels, logits, preds, mask
 
     val_acc  = vc / max(vt, 1)
     val_loss = vl_sum / max(vt, 1)
