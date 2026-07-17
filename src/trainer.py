@@ -439,6 +439,8 @@ class Trainer:
             # ── Epoch cleanup ───────────────────────────────────
             del train_stats, val_stats
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             try:
                 ctypes.CDLL('libc.so.6').malloc_trim(0)
             except Exception:

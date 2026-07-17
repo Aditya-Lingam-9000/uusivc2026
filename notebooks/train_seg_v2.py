@@ -35,10 +35,20 @@ HOW TO RUN on Kaggle:
 """
 
 import sys, os, json, random, time
+# Disable OpenCV/MKL multithreading inside workers/main process to prevent RAM bloat
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
 import cv2
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -330,21 +340,19 @@ elif TASK == "video_seg":
 
 print(f"\nTrain: {len(train_ds)}  |  Val: {len(val_ds)}")
 
-# DataLoader settings: NW=2 (not 4) to reduce Python worker overhead
-# Each worker process uses ~1-2GB RAM regardless of data size!
-# persistent_workers=False: workers die between epochs, freeing RAM
-# prefetch_factor=2: minimal pre-fetch queue to cap RAM
-NW = 2  # KEY: 2 workers = ~2-4GB overhead; 4 workers = ~4-8GB overhead
+# DataLoader settings: NW=0 to completely disable multiprocessing
+# This avoids any multiprocessing fork copy-on-write memory overhead,
+# and pin_memory=False avoids page-locked memory allocations.
+# Since data is pre-extracted and extremely fast to load, NW=0 runs at the same speed.
+NW = 0
 
 train_loader = DataLoader(
     train_ds, batch_size=CFG["batch_size"], shuffle=True,
-    num_workers=NW, pin_memory=True, drop_last=True,
-    persistent_workers=False, prefetch_factor=2,
+    num_workers=NW, pin_memory=False, drop_last=True,
 )
 val_loader = DataLoader(
     val_ds, batch_size=CFG["batch_size"] * 2, shuffle=False,
-    num_workers=NW, pin_memory=True,
-    persistent_workers=False, prefetch_factor=2,
+    num_workers=NW, pin_memory=False,
 )
 print(f"Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
 print(f"Effective batch size: {CFG['batch_size'] * CFG['grad_accum_steps']}")

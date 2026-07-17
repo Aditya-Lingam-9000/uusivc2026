@@ -22,10 +22,19 @@ HOW TO RUN:
 """
 
 import sys, os, json, random, time, gc, ctypes
+# Disable OpenCV/MKL multithreading inside workers/main process to prevent RAM bloat
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
 import cv2
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -250,19 +259,15 @@ train_loader = DataLoader(
     train_ds,
     batch_size=CFG["batch_size"],
     sampler=sampler,
-    num_workers=NW,
-    pin_memory=True,
-    persistent_workers=False,   # ← KEY: workers die after each epoch → free RAM
-    prefetch_factor=2,
+    num_workers=0,
+    pin_memory=False,
 )
 val_loader = DataLoader(
     val_ds,
     batch_size=CFG["batch_size"] * 2,
     shuffle=False,
-    num_workers=NW,
-    pin_memory=True,
-    persistent_workers=False,
-    prefetch_factor=2,
+    num_workers=0,
+    pin_memory=False,
 )
 print(f"Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
 print(f"Effective batch size: {CFG['batch_size'] * CFG['grad_accum_steps']}")
@@ -456,6 +461,8 @@ for epoch in range(start_epoch, epochs + 1):
     # ── Free page cache and heap between epochs ─────────────────────
     del ckpt_data
     gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     try:
         ctypes.CDLL('libc.so.6').malloc_trim(0)
     except Exception:
