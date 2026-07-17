@@ -228,8 +228,8 @@ class CEUSCLSModelV2(nn.Module):
         B, T, C, H, W = x.shape
 
         # Sample n_frames evenly
-        idx = torch.linspace(0, T - 1, self.n_frames).long()
-        x_s = x[:, idx]                               # (B, n, C, H, W)
+        idx = torch.linspace(0, T - 1, self.n_frames, device=x.device).long()
+        x_s = x[:, idx].contiguous()                               # (B, n, C, H, W)
 
         # Resize to square if needed
         if H != 256 or W != 256:
