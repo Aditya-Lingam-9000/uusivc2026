@@ -21,7 +21,7 @@ HOW TO RUN:
     exec(open('/kaggle/working/repo/notebooks/train_cls_v2.py').read())
 """
 
-import sys, os, json, random, time, gc
+import sys, os, json, random, time, gc, ctypes
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
@@ -181,8 +181,9 @@ class CEUSClsDataset(Dataset):
 
     def __getitem__(self, idx):
         item   = self.sample_list[idx]
-        frames = np.load(item["frames_path"])                          # (16,256,512,3) uint8
-        frames_t = torch.from_numpy(frames).permute(0, 3, 1, 2).float() / 255.0  # (16,3,256,512)
+        frames = np.load(item["frames_path"], mmap_mode='r')           # (16,256,512,3) uint8
+        # Copy to memory to avoid memory-map index overhead on CPU during permute/division
+        frames_t = torch.tensor(frames.copy()).permute(0, 3, 1, 2).float() / 255.0  # (16,3,256,512)
         return {
             "input": frames_t,
             "label": torch.tensor(item["label"], dtype=torch.long),
@@ -436,7 +437,6 @@ for epoch in range(start_epoch, epochs + 1):
     torch.save(ckpt_data, f"{CKPT_DIR}/{CKPT_PREFIX}_latest.pth")
     if is_best:
         torch.save(ckpt_data, f"{CKPT_DIR}/{CKPT_PREFIX}_best.pth")
-
     history.append({"epoch": epoch, "train_loss": train_loss, "train_acc": train_acc,
                     "val_loss": val_loss, "val_acc": val_acc})
 
@@ -453,8 +453,13 @@ for epoch in range(start_epoch, epochs + 1):
         print(f"    {org:20s}: {a:.4f}  ({org_c[org]}/{org_t[org]})")
     print(f"{'─'*65}")
 
-    # ── Free page cache between epochs ─────────────────────
+    # ── Free page cache and heap between epochs ─────────────────────
+    del ckpt_data
     gc.collect()
+    try:
+        ctypes.CDLL('libc.so.6').malloc_trim(0)
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────────────────────
 print(f"\n{'='*65}")

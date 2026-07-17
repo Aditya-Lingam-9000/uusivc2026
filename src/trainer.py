@@ -23,6 +23,7 @@ import time
 import math
 import gc
 from collections import defaultdict
+import ctypes
 
 import torch
 import torch.nn as nn
@@ -154,11 +155,19 @@ class Trainer:
             torch.save(ckpt, latest_path)
 
         # Save best when metric improved
+        best_path = None
         if is_best and self.cfg.get("save_best", True):
             best_path = os.path.join(self.ckpt_dir, f"{self.ckpt_prefix}_best.pth")
             torch.save(ckpt, best_path)
-            return best_path
-        return None
+
+        del ckpt  # ← CRITICAL: free weights dictionary from CPU RAM immediately!
+        gc.collect()
+        try:
+            ctypes.CDLL('libc.so.6').malloc_trim(0)
+        except Exception:
+            pass
+
+        return best_path
 
     # ── Checkpoint: load (resume) ─────────────────────────────
     def load_checkpoint(self, ckpt_path: str):
@@ -426,6 +435,14 @@ class Trainer:
             else:
                 print(f"  ─ Best remains: {metric_name}={self.best_metric:.4f}")
             print(f"{'─'*65}")
+
+            # ── Epoch cleanup ───────────────────────────────────
+            del train_stats, val_stats
+            gc.collect()
+            try:
+                ctypes.CDLL('libc.so.6').malloc_trim(0)
+            except Exception:
+                pass
 
         print(f"\n{'='*65}")
         print(f"✅ Training complete!")

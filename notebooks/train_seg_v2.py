@@ -163,29 +163,20 @@ class ImageSegDataset(Dataset):
 
 
 class CEUSSegDataset(Dataset):
-    """Dataset for ceus_seg. Extracts MIDDLE FRAME + loads NPZ mask."""
-    def __init__(self, samples, train_root, val_root, transform):
-        self.samples    = samples
-        self.train_root = Path(train_root)
-        self.val_root   = Path(val_root) if val_root else None
-        self.transform  = transform
+    """Dataset for ceus_seg. Loads pre-extracted middle frame + NPZ mask from disk."""
+    def __init__(self, sample_list, transform):
+        self.sample_list = sample_list
+        self.transform   = transform
 
-    def __len__(self): return len(self.samples)
+    def __len__(self): return len(self.sample_list)
 
     def __getitem__(self, idx):
-        s = self.samples[idx]
-        pr = get_partition_root(self.train_root, self.val_root, s["data_partition_group"])
+        item = self.sample_list[idx]
+        img_np   = np.load(item["img_path"], mmap_mode='r')     # (256, 512, 3) uint8
+        mask_raw = np.load(item["mask_path"], mmap_mode='r')    # (256, 512) uint8
 
-        # Load video → extract middle frame
-        video = np.load(pr / s["input_path_relative"])  # (15, 256, 512, 3) uint8
-        mid_frame = video[len(video) // 2]              # (256, 512, 3) uint8
-
-        # Load mask
-        npz = np.load(pr / s["annotation_path_relative"])
-        mask_raw = (npz["mask"] > 127).astype(np.uint8) * 255   # (256, 512) uint8
-
-        img_t, mask_t = apply_seg_transform(self.transform, mid_frame, mask_raw)
-        return {"input": img_t, "mask": mask_t, "organ": s["organ"]}
+        img_t, mask_t = apply_seg_transform(self.transform, img_np.copy(), mask_raw.copy())
+        return {"input": img_t, "mask": mask_t, "organ": item["organ"]}
 
 
 # Pre-extracted frame cache directory for video_seg
@@ -249,6 +240,48 @@ def preextract_video_frames(task_samples, train_root, val_root, preprocess_dir):
     return frame_list
 
 
+CEUS_SEG_PREP_DIR = Path("/kaggle/working/preprocessed_ceus_seg")
+
+def preextract_ceus_seg(samples, train_root, val_root, prep_dir):
+    prep_dir = Path(prep_dir)
+    prep_dir.mkdir(parents=True, exist_ok=True)
+    result = []
+    n_extracted = 0
+
+    print(f"\n📦 Pre-extracting CEUS middle frames (runs once)...")
+    for i, s in enumerate(samples):
+        pr  = get_partition_root(Path(train_root), Path(val_root) if val_root else None,
+                                 s["data_partition_group"])
+        sid = s["sample_id"]
+        img_path = prep_dir / f"{sid}_img.npy"
+        mask_path = prep_dir / f"{sid}_mask.npy"
+
+        if not img_path.exists() or not mask_path.exists():
+            # Load video → extract middle frame
+            video = np.load(pr / s["input_path_relative"])  # (15, 256, 512, 3) uint8
+            mid_frame = video[len(video) // 2]              # (256, 512, 3) uint8
+            
+            # Load mask
+            npz = np.load(pr / s["annotation_path_relative"])
+            mask_raw = (npz["mask"] > 127).astype(np.uint8) * 255   # (256, 512) uint8
+            
+            np.save(img_path, mid_frame)
+            np.save(mask_path, mask_raw)
+            n_extracted += 1
+
+        result.append({
+            "img_path": str(img_path),
+            "mask_path": str(mask_path),
+            "organ": s["organ"],
+            "sample_id": sid,
+        })
+        if (i + 1) % 200 == 0:
+            print(f"  {i+1}/{len(samples)} videos ready (new extractions: {n_extracted})")
+
+    print(f"Pre-extraction done. {n_extracted} new files. {len(result)} total samples.")
+    return result
+
+
 # ─────────────────────────────────────────────────────────────
 #  Build datasets and loaders
 # ─────────────────────────────────────────────────────────────
@@ -267,11 +300,19 @@ if TASK == "image_seg":
 elif TASK == "ceus_seg":
     train_tf = get_seg_transforms_ceus(CFG, mode="train")
     val_tf   = get_seg_transforms_ceus(CFG, mode="val")
+    # Pre-extract middle frames to disk
+    prep_list = preextract_ceus_seg(task_samples, TRAIN_PATH, VAL_PATH, CEUS_SEG_PREP_DIR)
+    
     random.shuffle(task_samples)
     n_val = max(1, int(len(task_samples) * CFG["val_split"]))
     val_s, train_s = task_samples[:n_val], task_samples[n_val:]
-    train_ds = CEUSSegDataset(train_s, TRAIN_PATH, VAL_PATH, train_tf)
-    val_ds   = CEUSSegDataset(val_s,   TRAIN_PATH, VAL_PATH, val_tf)
+    
+    sid_to_prep = {item["sample_id"]: item for item in prep_list}
+    train_pe = [sid_to_prep[s["sample_id"]] for s in train_s]
+    val_pe   = [sid_to_prep[s["sample_id"]] for s in val_s]
+    
+    train_ds = CEUSSegDataset(train_pe, train_tf)
+    val_ds   = CEUSSegDataset(val_pe,   val_tf)
 
 elif TASK == "video_seg":
     train_tf = get_seg_transforms_video(CFG, mode="train")
