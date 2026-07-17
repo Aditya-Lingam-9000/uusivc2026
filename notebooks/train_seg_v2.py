@@ -1,564 +1,355 @@
 """
-notebooks/train_seg_v2.py  —  UUSIVC segmentation training (image_seg, ceus_seg, video_seg)
+notebooks/train_seg_v2.py
+UUSIVC 2026 — Competition-Grade Segmentation Training (v2)
 
-KEY DESIGN:
-  - Pre-extract PNGs/videos → .npy files in /tmp/preprocessed/
-      /tmp/ has 57.6 GB disk on Kaggle — will NEVER fill the 19.5 GB /kaggle/working/ limit
-  - FastNpySegDataset reads .npy per batch — fast, zero RAM accumulation
-  - num_workers=2 with persistent_workers — workers prefetch while GPU computes
-  - GPU-native augmentations: only torch.flip + noise (NO TF.affine — it syncs to CPU!)
-  - AMP + DataParallel for dual T4
+Trains a single UNet++ model PER seg task:
+  - image_seg  (7 organs: Breast, Prostate, Breast_luminal, Fetal_Head, Heart, Kidney, Thyroid)
+  - ceus_seg   (4 organs: BreastCEUS, LiverCEUS, ProstateCEUS, ThyroidCEUS)
+  - video_seg  (cardiac frames: CardiacCH, CAMUS)
 
-HOW TO RUN:
-    TRAIN_PATH = "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN"
-    VAL_PATH   = "/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL"
-    CFG_OVERRIDES = {"batch_size": 16, "epochs": 40}
+Key improvements over v1:
+  ✅ EfficientNet-B5 + UNet++ (replaces ResNet-50 + basic UNet)
+  ✅ Compound loss: Dice + Focal + Boundary (directly improves NSD)
+  ✅ Albumentations heavy augmentation
+  ✅ Mixed Precision (AMP) — 30-50% VRAM savings
+  ✅ Gradient accumulation — effective batch size 32
+  ✅ EMA model for validation
+  ✅ Resume from checkpoint (Kaggle-safe)
+  ✅ Detailed per-25-step logging with VRAM + ETA
+  ✅ Per-organ metrics tracked
+
+HOW TO RUN on Kaggle:
+    !pip install segmentation-models-pytorch albumentations timm --quiet
+    !cd /kaggle/working && git clone https://github.com/Aditya-Lingam-9000/uusivc2026.git repo
+    import sys; sys.path.insert(0, '/kaggle/working/repo')
+    TRAIN_PATH = "/kaggle/input/.../TRAIN"
+    VAL_PATH   = "/kaggle/input/.../VAL"
+
+    # Train one task at a time (set TASK below):
+    TASK = "image_seg"   # or "ceus_seg" or "video_seg"
+    exec(open('/kaggle/working/repo/notebooks/train_seg_v2.py').read())
+
+    # Resume after timeout:
+    CFG["resume_from"] = f"/kaggle/working/checkpoints/{TASK}_v2_latest.pth"
     exec(open('/kaggle/working/repo/notebooks/train_seg_v2.py').read())
 """
 
-import sys, os, json, random, time, gc
-from collections import defaultdict
+import sys, os, json, random, time
 from pathlib import Path
+from collections import defaultdict
 import numpy as np
+import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.amp import autocast, GradScaler
-from PIL import Image
 
-# ── Force src module reload ────────────────────────────────────
+# ── Force src reload ───────────────────────────────────────────
 for mod in list(sys.modules.keys()):
     if mod.startswith("src"):
         del sys.modules[mod]
 
-# ── Config ────────────────────────────────────────────────────
-from src.config import get_cfg, print_cfg
-cfg = get_cfg("seg")
+# ── Config / Paths ─────────────────────────────────────────────
+TRAIN_PATH = globals().get("TRAIN_PATH", "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN")
+VAL_PATH   = globals().get("VAL_PATH",   "/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL")
+TASK       = globals().get("TASK", "image_seg")   # "image_seg" | "ceus_seg" | "video_seg"
 
-_gbl = globals()
-if "TRAIN_PATH" in _gbl:
-    cfg["train_root"] = _gbl["TRAIN_PATH"]
-if "VAL_PATH" in _gbl:
-    cfg["val_root"] = _gbl["VAL_PATH"]
+from src.config import CFG
+CFG["train_path"] = TRAIN_PATH
+CFG["val_path"]   = VAL_PATH
+CFG["ckpt_dir"]   = "/kaggle/working/checkpoints"
 
-# Use /tmp/ for pre-extracted .npy files — it has 57.6 GB disk space on Kaggle
-# This avoids filling the 19.5 GB /kaggle/working/ limit
-cfg["preprocess_dir"] = "/tmp/preprocessed_resized"  # new dir — images stored at target size
-cfg["seg_loss"] = "dice_focal"        # no boundary loss (no scipy)
-cfg["num_workers"] = 2                # 2 workers prefetch while GPU computes
-cfg["pin_memory"] = True              # faster CPU→GPU transfer
-cfg.update(_gbl.get("CFG_OVERRIDES", {}))
+# ── Task-specific overrides ─────────────────────────────────────
+if TASK == "image_seg":
+    CFG["img_size"]    = 512
+    CFG["batch_size"]  = 4
+    CFG["grad_accum_steps"] = 8     # Effective batch = 32
+    CFG["epochs"]      = 60
+elif TASK == "ceus_seg":
+    CFG["img_size"]    = 256        # Height — width will be 512
+    CFG["batch_size"]  = 8
+    CFG["grad_accum_steps"] = 4
+    CFG["epochs"]      = 50
+elif TASK == "video_seg":
+    CFG["img_size"]    = 256
+    CFG["batch_size"]  = 16
+    CFG["grad_accum_steps"] = 2
+    CFG["epochs"]      = 40
 
-os.makedirs(cfg["ckpt_dir"], exist_ok=True)
-os.makedirs(cfg["preprocess_dir"], exist_ok=True)
+CKPT_PREFIX = f"{TASK}_v2"
 
+# ── Device ─────────────────────────────────────────────────────
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-N_GPU = torch.cuda.device_count() if torch.cuda.is_available() else 0
-LOG_EVERY = cfg.get("log_every_n_batches", 25)
+print(f"Device: {DEVICE}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    if torch.cuda.device_count() > 1:
+        print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
 
-TRAIN   = cfg["train_root"]
-VAL_DIR = cfg["val_root"]
-PREPROC = cfg["preprocess_dir"]
+torch.manual_seed(CFG["seed"]); random.seed(CFG["seed"]); np.random.seed(CFG["seed"])
 
-# ── Src imports ────────────────────────────────────────────────
-from src.models_v2    import build_seg_model
-from src.losses_v2   import CompoundSegLoss
-from src.trainer     import (EMA, build_optimizer, build_scheduler,
-                              save_checkpoint, load_checkpoint,
-                              dice_score_fn, format_time, get_vram_usage)
-from src.dataset     import get_partition_root
+# ── Imports ────────────────────────────────────────────────────
+from src.dataset import get_partition_root
+from src.models_v2 import build_seg_model, EMA, build_optimizer, build_scheduler
+from src.losses_v2 import CompoundSegLoss
+from src.augmentations_v2 import (
+    get_seg_transforms, get_seg_transforms_ceus, get_seg_transforms_video,
+    apply_seg_transform, ALBUMENTATIONS_AVAILABLE
+)
+from src.trainer import Trainer
 
-print(f"  Device : {DEVICE}")
-for i in range(N_GPU):
-    print(f"  GPU {i}  : {torch.cuda.get_device_name(i)}")
-print(f"  N_GPU  : {N_GPU}")
 print("✅ All imports OK")
-print_cfg(cfg)
+if not ALBUMENTATIONS_AVAILABLE:
+    print("⚠️  Install albumentations for best augmentation: pip install albumentations")
 
-# ── Load ground-truth JSON ─────────────────────────────────────
-PRIVATE_GT = f"{TRAIN}/dataset_json_fingerprints_v4/private_train_ground_truth.json"
-PUBLIC_GT  = f"{TRAIN}/dataset_json_fingerprints_v4/public_all_ground_truth.json"
+# ─────────────────────────────────────────────────────────────
+#  Load JSON ground-truth
+# ─────────────────────────────────────────────────────────────
+PRIVATE_GT = f"{TRAIN_PATH}/dataset_json_fingerprints_v4/private_train_ground_truth.json"
+PUBLIC_GT  = f"{TRAIN_PATH}/dataset_json_fingerprints_v4/public_all_ground_truth.json"
 
 all_samples = []
 for jp in [PRIVATE_GT, PUBLIC_GT]:
     if os.path.exists(jp):
         with open(jp) as f:
             all_samples.extend(json.load(f))
-print(f"Total training samples loaded: {len(all_samples)}")
 
+task_samples = [s for s in all_samples if s["task"] == TASK]
+print(f"\nTotal {TASK} samples: {len(task_samples)}")
 
-# ═══════════════════════════════════════════════════════════════
-#  DATASET — reads pre-extracted .npy files from /tmp/
-# ═══════════════════════════════════════════════════════════════
-class FastNpySegDataset(Dataset):
-    """Reads .npy pairs, resizes to target shape, applies flips."""
-    def __init__(self, records, img_size):
-        self.records = records
-        # img_size can be int (square) or (H, W) tuple
-        h, w = (img_size, img_size) if isinstance(img_size, int) else img_size[:2]
-        self.pil_size = (w, h)   # PIL wants (width, height)
-        self.tgt_hw   = (h, w)
+organ_counts = defaultdict(int)
+for s in task_samples:
+    organ_counts[s.get("dataset_name", s["organ"])] += 1
+print("Per-dataset counts:")
+for ds, cnt in sorted(organ_counts.items()):
+    print(f"  {ds:20s}: {cnt}")
 
-    def __len__(self):
-        return len(self.records)
+# ─────────────────────────────────────────────────────────────
+#  Dataset classes
+# ─────────────────────────────────────────────────────────────
+from PIL import Image as PILImage
 
-    def __getitem__(self, idx):
-        r = self.records[idx]
-        # Files are already resized to target — just load + flip (zero PIL overhead)
-        img_np  = np.load(r["img_path"])   # (H, W, 3) uint8
-        mask_np = np.load(r["mask_path"])  # (H, W) float32
+class ImageSegDataset(Dataset):
+    """Dataset for image_seg. Loads PNG image + PNG mask."""
+    def __init__(self, samples, train_root, val_root, transform):
+        self.samples    = samples
+        self.train_root = Path(train_root)
+        self.val_root   = Path(val_root) if val_root else None
+        self.transform  = transform
 
-        if random.random() < 0.5:
-            img_np  = img_np[:, ::-1, :]
-            mask_np = mask_np[:, ::-1]
-        if random.random() < 0.2:
-            img_np  = img_np[::-1, :, :]
-            mask_np = mask_np[::-1, :]
-
-        img_t  = torch.tensor(np.ascontiguousarray(img_np),  dtype=torch.float32).permute(2, 0, 1) / 255.0
-        mask_t = torch.tensor(np.ascontiguousarray(mask_np), dtype=torch.float32).unsqueeze(0)
-        return {"input": img_t, "mask": mask_t, "organ": r.get("organ", "Unknown")}
-
-
-class ValNpySegDataset(Dataset):
-    """Reads .npy pairs, resizes to target shape — no augmentation."""
-    def __init__(self, records, img_size):
-        self.records = records
-        h, w = (img_size, img_size) if isinstance(img_size, int) else img_size[:2]
-        self.pil_size = (w, h)
-        self.tgt_hw   = (h, w)
-
-    def __len__(self):
-        return len(self.records)
+    def __len__(self): return len(self.samples)
 
     def __getitem__(self, idx):
-        r = self.records[idx]
-        img_np  = np.load(r["img_path"])
-        mask_np = np.load(r["mask_path"])
-        img_t  = torch.tensor(np.ascontiguousarray(img_np),  dtype=torch.float32).permute(2, 0, 1) / 255.0
-        mask_t = torch.tensor(np.ascontiguousarray(mask_np), dtype=torch.float32).unsqueeze(0)
-        return {"input": img_t, "mask": mask_t, "organ": r.get("organ", "Unknown")}
+        s = self.samples[idx]
+        pr = get_partition_root(self.train_root, self.val_root, s["data_partition_group"])
+
+        # Load image
+        img_path = pr / s["img_path_relative"]
+        img = np.array(PILImage.open(img_path).convert("RGB"))  # (H, W, 3) uint8
+
+        # Load mask
+        mask_path = pr / s["mask_path_relative"]
+        mask_raw = np.array(PILImage.open(mask_path))
+        if mask_raw.dtype == bool:
+            mask_raw = mask_raw.astype(np.uint8) * 255
+        if mask_raw.ndim == 3:
+            mask_raw = mask_raw[:, :, 0]
+        # mask_raw: (H, W) uint8
+
+        img_t, mask_t = apply_seg_transform(self.transform, img, mask_raw)
+        return {"input": img_t, "mask": mask_t, "organ": s["organ"]}
 
 
-# ── GPU-native normalization (fast, no CPU sync) ───────────────
-_MEAN = None
-_STD  = None
+class CEUSSegDataset(Dataset):
+    """Dataset for ceus_seg. Extracts MIDDLE FRAME + loads NPZ mask."""
+    def __init__(self, samples, train_root, val_root, transform):
+        self.samples    = samples
+        self.train_root = Path(train_root)
+        self.val_root   = Path(val_root) if val_root else None
+        self.transform  = transform
 
-def gpu_normalize(imgs):
-    global _MEAN, _STD
-    if _MEAN is None or _MEAN.device != imgs.device:
-        _MEAN = torch.tensor([0.485, 0.456, 0.406], device=imgs.device).view(1,3,1,1)
-        _STD  = torch.tensor([0.229, 0.224, 0.225], device=imgs.device).view(1,3,1,1)
-    return (imgs - _MEAN) / _STD
+    def __len__(self): return len(self.samples)
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        pr = get_partition_root(self.train_root, self.val_root, s["data_partition_group"])
+
+        # Load video → extract middle frame
+        video = np.load(pr / s["input_path_relative"])  # (15, 256, 512, 3) uint8
+        mid_frame = video[len(video) // 2]              # (256, 512, 3) uint8
+
+        # Load mask
+        npz = np.load(pr / s["annotation_path_relative"])
+        mask_raw = (npz["mask"] > 127).astype(np.uint8) * 255   # (256, 512) uint8
+
+        img_t, mask_t = apply_seg_transform(self.transform, mid_frame, mask_raw)
+        return {"input": img_t, "mask": mask_t, "organ": s["organ"]}
 
 
-# ═══════════════════════════════════════════════════════════════
-#  PRE-EXTRACTION → /tmp/preprocessed/  (57 GB disk, safe!)
-# ═══════════════════════════════════════════════════════════════
-def preextract_image_seg(task_samples, train_root, val_root, preproc_dir, pil_size):
-    """Extract and RESIZE to pil_size=(W,H) — workers never PIL resize again."""
-    out_dir = Path(preproc_dir) / "image_seg"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    records, skipped = [], 0
-    t0, total = time.time(), len(task_samples)
+# Pre-extracted frame cache directory for video_seg
+PREPROCESS_DIR = Path("/kaggle/working/preprocessed_video_seg_v2")
 
+class VideoSegDataset(Dataset):
+    """Dataset for video_seg. Pre-extracts frames to disk for fast loading."""
+    def __init__(self, frame_list, transform):
+        self.frame_list = frame_list
+        self.transform  = transform
+
+    def __len__(self): return len(self.frame_list)
+
+    def __getitem__(self, idx):
+        item = self.frame_list[idx]
+        frame    = np.load(item["img_path"])    # (256, 256) float [0,255]
+        mask_raw = np.load(item["mask_path"])   # (256, 256) float {0,255}
+
+        # Convert to HWC uint8 for albumentations
+        frame_u8 = np.clip(frame, 0, 255).astype(np.uint8)
+        frame_rgb = np.stack([frame_u8, frame_u8, frame_u8], axis=2)   # (H,W,3)
+        mask_u8   = (mask_raw > 0.5).astype(np.uint8) * 255
+
+        img_t, mask_t = apply_seg_transform(self.transform, frame_rgb, mask_u8)
+        return {"input": img_t, "mask": mask_t, "organ": "Cardiac"}
+
+
+def preextract_video_frames(task_samples, train_root, val_root, preprocess_dir):
+    """Pre-extract and save 2D cardiac frames to disk to avoid reloading 3D .npy."""
+    preprocess_dir.mkdir(parents=True, exist_ok=True)
+    frame_list = []
+    print(f"\nPre-extracting {TASK} frames to {preprocess_dir} ...")
+    t0 = time.time()
     for idx, s in enumerate(task_samples):
-        part_root = get_partition_root(
-            Path(train_root), Path(val_root) if val_root else None,
-            s["data_partition_group"],
-        )
-        sid   = s["sample_id"]
-        img_p = out_dir / f"{sid}_img.npy"
-        msk_p = out_dir / f"{sid}_msk.npy"
-
-        if not img_p.exists():
-            try:
-                img_pil  = Image.open(part_root / s["img_path_relative"]).convert("RGB")
-                if img_pil.size != pil_size:
-                    img_pil = img_pil.resize(pil_size, Image.BILINEAR)
-                img_raw  = np.array(img_pil, dtype=np.uint8)
-
-                msk_pil  = Image.open(part_root / s["mask_path_relative"])
-                if msk_pil.size != pil_size:
-                    msk_pil = msk_pil.resize(pil_size, Image.NEAREST)
-                mask_raw = np.array(msk_pil)
-                if mask_raw.dtype == bool:
-                    mask_raw = mask_raw.astype(np.uint8) * 255
-                if mask_raw.ndim == 3:
-                    mask_raw = mask_raw[:, :, 0]
-                mask_bin = (mask_raw > 127).astype(np.float32)
-                np.save(str(img_p), img_raw)
-                np.save(str(msk_p), mask_bin)
-            except Exception as e:
-                skipped += 1
-                if skipped <= 5:
-                    print(f"  [WARN] {sid}: {e}")
-                continue
-
-        records.append({"img_path": str(img_p), "mask_path": str(msk_p),
-                         "sample_id": sid, "organ": s.get("organ", s.get("dataset_name", "Unknown"))})
-        if (idx + 1) % 500 == 0:
-            el = time.time() - t0
-            eta = el / (idx + 1) * (total - idx - 1)
-            print(f"  [{idx+1}/{total}]  elapsed={format_time(el)}  ETA={format_time(eta)}")
-
-    print(f"  ✅ image_seg: {len(records)} records (skipped={skipped})")
-    return records
-
-
-def preextract_ceus_seg(task_samples, train_root, val_root, preproc_dir, pil_size):
-    out_dir = Path(preproc_dir) / "ceus_seg"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    records, skipped = [], 0
-
-    for idx, s in enumerate(task_samples):
-        part_root = get_partition_root(
-            Path(train_root), Path(val_root) if val_root else None,
-            s["data_partition_group"],
-        )
-        sid   = s["sample_id"]
-        img_p = out_dir / f"{sid}_img.npy"
-        msk_p = out_dir / f"{sid}_msk.npy"
-
-        if not img_p.exists():
-            try:
-                video   = np.load(part_root / s["input_path_relative"])
-                mid     = video[video.shape[0] // 2].astype(np.uint8)
-                mid_pil = Image.fromarray(mid)
-                if mid_pil.size != pil_size:
-                    mid_pil = mid_pil.resize(pil_size, Image.BILINEAR)
-                np.save(str(img_p), np.array(mid_pil, dtype=np.uint8))
-
-                npz     = np.load(part_root / s["annotation_path_relative"])
-                mask    = (npz["mask"] > 127).astype(np.uint8)
-                msk_pil = Image.fromarray(mask * 255)
-                if msk_pil.size != pil_size:
-                    msk_pil = msk_pil.resize(pil_size, Image.NEAREST)
-                np.save(str(msk_p), (np.array(msk_pil) > 127).astype(np.float32))
-            except Exception:
-                skipped += 1
-                continue
-
-        records.append({"img_path": str(img_p), "mask_path": str(msk_p),
-                         "sample_id": sid, "organ": s.get("organ", "Unknown")})
-        if (idx + 1) % 200 == 0:
-            print(f"  ceus_seg [{idx+1}/{len(task_samples)}]")
-
-    print(f"  ✅ ceus_seg: {len(records)} records (skipped={skipped})")
-    return records
-
-
-def preextract_video_seg(task_samples, train_root, val_root, preproc_dir, pil_size):
-    out_dir = Path(preproc_dir) / "video_seg"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    records = []
-
-    for idx, s in enumerate(task_samples):
-        part_root = get_partition_root(
-            Path(train_root), Path(val_root) if val_root else None,
-            s["data_partition_group"],
-        )
-        sid = s["sample_id"]
+        pr = get_partition_root(Path(train_root), Path(val_root) if val_root else None,
+                                s["data_partition_group"])
+        ann_path = pr / s["annotation_path_relative"]
+        if not ann_path.exists():
+            continue
         try:
-            npz       = np.load(part_root / s["annotation_path_relative"], allow_pickle=True)
+            npz = np.load(ann_path, allow_pickle=True)
             fnum_mask = npz["fnum_mask"].item()
-            video     = None
+            npy_path = pr / s["input_path_relative"]
+            video = None
+            sid   = s["sample_id"]
             for frame_key, mask_arr in fnum_mask.items():
-                fidx  = int(frame_key)
-                img_p = out_dir / f"{sid}_f{fidx}_img.npy"
-                msk_p = out_dir / f"{sid}_f{fidx}_msk.npy"
+                fidx = int(frame_key)
+                img_p  = preprocess_dir / f"{sid}_f{fidx}_img.npy"
+                mask_p = preprocess_dir / f"{sid}_f{fidx}_mask.npy"
                 if not img_p.exists():
                     if video is None:
-                        video = np.load(part_root / s["input_path_relative"])
-                    frame    = video[0, fidx]
-                    frame_u8 = np.clip(frame, 0, 255).astype(np.uint8)
-                    frame_3  = np.stack([frame_u8] * 3, axis=-1)
-                    frm_pil  = Image.fromarray(frame_3)
-                    if frm_pil.size != pil_size:
-                        frm_pil = frm_pil.resize(pil_size, Image.BILINEAR)
-                    msk_u8   = (mask_arr > 127).astype(np.uint8)
-                    msk_pil  = Image.fromarray(msk_u8 * 255)
-                    if msk_pil.size != pil_size:
-                        msk_pil = msk_pil.resize(pil_size, Image.NEAREST)
-                    np.save(str(img_p), np.array(frm_pil, dtype=np.uint8))
-                    np.save(str(msk_p), (np.array(msk_pil) > 127).astype(np.float32))
-                records.append({"img_path": str(img_p), "mask_path": str(msk_p),
-                                 "sample_id": sid, "organ": s.get("organ", "Cardiac")})
-            del video
-        except Exception:
-            pass
-        if (idx + 1) % 200 == 0:
-            print(f"  video_seg [{idx+1}/{len(task_samples)}]")
-
-    print(f"  ✅ video_seg: {len(records)} records")
-    return records
+                        video = np.load(npy_path)  # (3, T, 256, 256) float
+                    frame = video[0, fidx]  # (256, 256) float
+                    np.save(img_p, frame.astype(np.float32))
+                    np.save(mask_p, mask_arr.astype(np.float32))
+                frame_list.append({"img_path": str(img_p), "mask_path": str(mask_p),
+                                   "sample_id": sid})
+        except Exception as e:
+            print(f"  Warning: {ann_path}: {e}")
+        if (idx + 1) % 100 == 0:
+            print(f"  {idx+1}/{len(task_samples)} videos processed ...")
+    print(f"Pre-extraction done in {time.time()-t0:.1f}s  |  {len(frame_list)} frames total")
+    return frame_list
 
 
-# ── Train/val split ────────────────────────────────────────────
-def split_records(records, val_frac, seed):
-    random.seed(seed)
-    organ_to_idx = defaultdict(list)
-    for i, r in enumerate(records):
-        organ_to_idx[r.get("organ", "Unknown")].append(i)
-    train_idx, val_idx = [], []
-    for idxs in organ_to_idx.values():
-        random.shuffle(idxs)
-        n_val = max(1, int(len(idxs) * val_frac))
-        val_idx.extend(idxs[:n_val])
-        train_idx.extend(idxs[n_val:])
-    return [records[i] for i in train_idx], [records[i] for i in val_idx]
+# ─────────────────────────────────────────────────────────────
+#  Build datasets and loaders
+# ─────────────────────────────────────────────────────────────
+random.seed(CFG["seed"])
 
+if TASK == "image_seg":
+    train_tf = get_seg_transforms(CFG, mode="train")
+    val_tf   = get_seg_transforms(CFG, mode="val")
+    # Split by sample (stratified shuffle)
+    random.shuffle(task_samples)
+    n_val = max(1, int(len(task_samples) * CFG["val_split"]))
+    val_s, train_s = task_samples[:n_val], task_samples[n_val:]
+    train_ds = ImageSegDataset(train_s, TRAIN_PATH, VAL_PATH, train_tf)
+    val_ds   = ImageSegDataset(val_s,   TRAIN_PATH, VAL_PATH, val_tf)
 
-# ═══════════════════════════════════════════════════════════════
-#  MAIN TASK LOOP
-# ═══════════════════════════════════════════════════════════════
-for current_task in cfg["seg_tasks"]:
-    print(f"\n{'='*60}")
-    print(f"  TRAINING: {current_task}")
-    print(f"{'='*60}")
+elif TASK == "ceus_seg":
+    train_tf = get_seg_transforms_ceus(CFG, mode="train")
+    val_tf   = get_seg_transforms_ceus(CFG, mode="val")
+    random.shuffle(task_samples)
+    n_val = max(1, int(len(task_samples) * CFG["val_split"]))
+    val_s, train_s = task_samples[:n_val], task_samples[n_val:]
+    train_ds = CEUSSegDataset(train_s, TRAIN_PATH, VAL_PATH, train_tf)
+    val_ds   = CEUSSegDataset(val_s,   TRAIN_PATH, VAL_PATH, val_tf)
 
-    task_samples = [s for s in all_samples if s["task"] == current_task]
-    print(f"Total {current_task} samples: {len(task_samples)}")
-    if not task_samples:
-        print("  ⚠️  No samples, skipping")
-        continue
+elif TASK == "video_seg":
+    train_tf = get_seg_transforms_video(CFG, mode="train")
+    val_tf   = get_seg_transforms_video(CFG, mode="val")
+    frame_list = preextract_video_frames(task_samples, TRAIN_PATH, VAL_PATH, PREPROCESS_DIR)
+    # Split by video ID to prevent data leakage
+    video_ids = list({f["sample_id"] for f in frame_list})
+    random.shuffle(video_ids)
+    n_val_vids = max(1, int(len(video_ids) * CFG["val_split"]))
+    val_vids   = set(video_ids[:n_val_vids])
+    train_frames = [f for f in frame_list if f["sample_id"] not in val_vids]
+    val_frames   = [f for f in frame_list if f["sample_id"] in val_vids]
+    train_ds = VideoSegDataset(train_frames, train_tf)
+    val_ds   = VideoSegDataset(val_frames,   val_tf)
 
-    if current_task == "image_seg":
-        img_size = cfg["img_size_seg"]         # 512
-        cfg["ckpt_prefix"] = "image_seg"
-    elif current_task == "ceus_seg":
-        img_size = cfg["img_size_ceus_seg"]    # (256, 512) H x W
-        cfg["ckpt_prefix"] = "ceus_seg"
-    elif current_task == "video_seg":
-        img_size = cfg["img_size_video_seg"]   # 256
-        cfg["ckpt_prefix"] = "video_seg"
-    else:
-        img_size = cfg["img_size_seg"]
-        cfg["ckpt_prefix"] = current_task
+print(f"\nTrain: {len(train_ds)}  |  Val: {len(val_ds)}")
 
-    # Compute PIL size (W, H) from img_size (H or (H,W))
-    if isinstance(img_size, int):
-        pil_size = (img_size, img_size)
-    else:
-        pil_size = (img_size[1], img_size[0])   # PIL wants (width, height)
+train_loader = DataLoader(
+    train_ds, batch_size=CFG["batch_size"], shuffle=True,
+    num_workers=CFG["num_workers"], pin_memory=CFG["pin_memory"],
+    drop_last=True,
+)
+val_loader = DataLoader(
+    val_ds, batch_size=CFG["batch_size"] * 2, shuffle=False,
+    num_workers=CFG["num_workers"], pin_memory=CFG["pin_memory"],
+)
+print(f"Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
+print(f"Effective batch size: {CFG['batch_size'] * CFG['grad_accum_steps']}")
 
-    # ── Pre-extract to /tmp/preprocessed_resized/ ──────────────
-    print(f"\n  📦 Pre-extracting {current_task} → {PREPROC}  (resize to {pil_size})")
-    t_pre = time.time()
-    if current_task == "image_seg":
-        all_records = preextract_image_seg(task_samples, TRAIN, VAL_DIR, PREPROC, pil_size)
-    elif current_task == "ceus_seg":
-        all_records = preextract_ceus_seg(task_samples, TRAIN, VAL_DIR, PREPROC, pil_size)
-    elif current_task == "video_seg":
-        all_records = preextract_video_seg(task_samples, TRAIN, VAL_DIR, PREPROC, pil_size)
-    print(f"  Pre-extraction: {format_time(time.time() - t_pre)}")
+# ─────────────────────────────────────────────────────────────
+#  Build Model, Loss, Optimizer, Scheduler
+# ─────────────────────────────────────────────────────────────
+model = build_seg_model(CFG)
+if torch.cuda.device_count() > 1:
+    model = nn.DataParallel(model)
+model = model.to(DEVICE)
+total_params = sum(p.numel() for p in model.parameters())
+print(f"\nModel params: {total_params:,}")
 
-    if current_task == "video_seg":
-        all_ids = list(set(r["sample_id"] for r in all_records))
-        random.seed(cfg["seed"])
-        random.shuffle(all_ids)
-        n_val   = max(1, int(len(all_ids) * cfg["val_split"]))
-        val_ids = set(all_ids[:n_val])
-        train_records = [r for r in all_records if r["sample_id"] not in val_ids]
-        val_records   = [r for r in all_records if r["sample_id"] in val_ids]
-    else:
-        train_records, val_records = split_records(all_records, cfg["val_split"], cfg["seed"])
+criterion = CompoundSegLoss(CFG).to(DEVICE)
+print(f"Loss: Dice({CFG['seg_dice_weight']}) + Focal({CFG['seg_focal_weight']}) "
+      f"+ Boundary({CFG['seg_boundary_weight']})")
 
-    print(f"  Train: {len(train_records)}  Val: {len(val_records)}")
+raw_model = model.module if hasattr(model, "module") else model
+optimizer  = build_optimizer(raw_model, CFG)
+scheduler  = build_scheduler(optimizer, CFG)
+ema        = EMA(raw_model, decay=CFG["ema_decay"])
 
-    # ── DataLoaders ────────────────────────────────────────────
-    bs = cfg["batch_size"]
-    nw = cfg["num_workers"]
-    train_ds = FastNpySegDataset(train_records, img_size)
-    val_ds   = ValNpySegDataset(val_records,   img_size)
-    train_loader = DataLoader(
-        train_ds, batch_size=bs, shuffle=True, drop_last=True,
-        num_workers=nw, pin_memory=cfg["pin_memory"],
-        persistent_workers=(nw > 0), prefetch_factor=2 if nw > 0 else None,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=bs, shuffle=False,
-        num_workers=nw, pin_memory=cfg["pin_memory"],
-        persistent_workers=(nw > 0), prefetch_factor=2 if nw > 0 else None,
-    )
-    print(f"  Train batches: {len(train_loader)}  Val batches: {len(val_loader)}")
-    print(f"  Effective batch: {bs} × {max(N_GPU,1)} GPUs = {bs*max(N_GPU,1)}")
+# ─────────────────────────────────────────────────────────────
+#  Train
+# ─────────────────────────────────────────────────────────────
+trainer = Trainer(
+    model=model,
+    optimizer=optimizer,
+    scheduler=scheduler,
+    criterion=criterion,
+    cfg=CFG,
+    device=DEVICE,
+    task_type="seg",
+    ema=ema,
+    ckpt_prefix=CKPT_PREFIX,
+)
 
-    # ── Model ──────────────────────────────────────────────────
-    model = build_seg_model(cfg)
-    if N_GPU > 1:
-        print(f"  Wrapping in DataParallel ({N_GPU} GPUs)")
-        model = nn.DataParallel(model)
-    model = model.to(DEVICE)
-    print(f"  Model params: {sum(p.numel() for p in model.parameters()):,}")
+best_dice, history = trainer.fit(train_loader, val_loader)
 
-    # ── Loss / Optimizer / Scheduler ──────────────────────────
-    criterion = CompoundSegLoss(cfg)
-    optimizer = build_optimizer(model, cfg)
-    scheduler = build_scheduler(optimizer, cfg)
-    scaler    = GradScaler("cuda", enabled=cfg["use_amp"])
-    ema       = EMA(model, decay=cfg["ema_decay"]) if cfg["use_ema"] else None
+# ─────────────────────────────────────────────────────────────
+#  Save history JSON
+# ─────────────────────────────────────────────────────────────
+import json as _json
+with open(f"{CFG['ckpt_dir']}/{CKPT_PREFIX}_history.json", "w") as f:
+    _json.dump(history, f, indent=2)
 
-    start_epoch, best_metric, history = load_checkpoint(
-        model, optimizer, scheduler, scaler, cfg,
-    )
-
-    accum = cfg["grad_accum_steps"]
-    patience_counter = 0
-
-    for epoch in range(start_epoch, cfg["epochs"] + 1):
-        t_epoch = time.time()
-
-        # ═════════ TRAIN ═════════
-        model.train()
-        stats   = defaultdict(float)
-        n_train = 0
-        optimizer.zero_grad()
-
-        for batch_idx, batch in enumerate(train_loader):
-            imgs  = batch["input"].to(DEVICE, non_blocking=True)
-            masks = batch["mask"].to(DEVICE, non_blocking=True)
-
-            # GPU-native normalize (no CPU sync)
-            imgs = gpu_normalize(imgs)
-
-            with autocast("cuda", enabled=cfg["use_amp"]):
-                logits = model(imgs)
-                if logits.shape[2:] != masks.shape[2:]:
-                    logits = F.interpolate(logits, size=masks.shape[2:],
-                                           mode="bilinear", align_corners=False)
-                loss, loss_parts = criterion(logits, masks, None)
-                loss = loss / accum
-
-            scaler.scale(loss).backward()
-
-            if (batch_idx + 1) % accum == 0 or (batch_idx + 1) == len(train_loader):
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-                if ema:
-                    ema.update(model)
-
-            bs_actual = imgs.size(0)
-            stats["loss"]       += loss.item() * accum * bs_actual
-            stats["dice_loss"]  += loss_parts["dice"] * bs_actual
-            stats["focal_loss"] += loss_parts["focal"] * bs_actual
-            with torch.no_grad():
-                stats["dice"] += dice_score_fn(logits.detach(), masks).item() * bs_actual
-            n_train += bs_actual
-
-            if (batch_idx + 1) % LOG_EVERY == 0:
-                sl  = stats["loss"] / max(n_train, 1)
-                sd  = stats["dice"] / max(n_train, 1)
-                el  = time.time() - t_epoch
-                eta = el / (batch_idx + 1) * (len(train_loader) - batch_idx - 1)
-                lr  = optimizer.param_groups[0]["lr"]
-                print(
-                    f"  Ep[{epoch:02d}] Step[{batch_idx+1:04d}/{len(train_loader)}] "
-                    f"loss={sl:.4f} dice={sd:.4f} lr={lr:.2e} "
-                    f"VRAM={get_vram_usage()} ETA={format_time(eta)}"
-                )
-
-        if scheduler:
-            scheduler.step()
-
-        # ═════════ VALIDATE ═════════
-        model.eval()
-        if ema:
-            ema.apply(model)
-
-        val_stats  = defaultdict(float)
-        organ_dice = defaultdict(lambda: [0.0, 0])
-        n_val      = 0
-
-        with torch.no_grad():
-            for batch in val_loader:
-                imgs   = batch["input"].to(DEVICE, non_blocking=True)
-                masks  = batch["mask"].to(DEVICE, non_blocking=True)
-                organs = batch["organ"]
-                imgs   = gpu_normalize(imgs)
-
-                with autocast("cuda", enabled=cfg["use_amp"]):
-                    logits = model(imgs)
-                    if logits.shape[2:] != masks.shape[2:]:
-                        logits = F.interpolate(logits, size=masks.shape[2:],
-                                               mode="bilinear", align_corners=False)
-                    loss, _ = criterion(logits, masks, None)
-
-                bs_v = imgs.size(0)
-                val_stats["loss"] += loss.item() * bs_v
-                val_stats["dice"] += dice_score_fn(logits, masks).item() * bs_v
-                n_val += bs_v
-
-                for i, organ in enumerate(organs):
-                    od = dice_score_fn(logits[i:i+1], masks[i:i+1]).item()
-                    organ_dice[organ][0] += od
-                    organ_dice[organ][1] += 1
-
-        if ema:
-            ema.restore(model)
-
-        # ═════════ EPOCH SUMMARY ═════════
-        tl = stats["loss"]  / max(n_train, 1)
-        td = stats["dice"]  / max(n_train, 1)
-        vl = val_stats["loss"] / max(n_val, 1)
-        vd = val_stats["dice"] / max(n_val, 1)
-        el = time.time() - t_epoch
-        lr = optimizer.param_groups[0]["lr"]
-
-        print(f"\n{'─'*60}")
-        print(f"  ✅ EPOCH {epoch:02d}/{cfg['epochs']}  time={format_time(el)}  LR={lr:.2e}")
-        print(f"  Train → loss={tl:.4f}  dice={td:.4f}")
-        print(f"  Val   → loss={vl:.4f}  dice={vd:.4f}  (best={best_metric:.4f})  VRAM={get_vram_usage()}")
-        if organ_dice:
-            print("  Per-organ val dice:")
-            for org in sorted(organ_dice):
-                tot, cnt = organ_dice[org]
-                print(f"    {org:22s}: {tot/cnt:.4f}  (n={cnt})")
-        print(f"{'─'*60}")
-
-        # ── Checkpoint ────────────────────────────────────────
-        is_best = vd > best_metric
-        if is_best:
-            best_metric = vd
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
-        save_checkpoint(model, optimizer, scheduler, scaler, epoch,
-                        best_metric, history, cfg, is_best=is_best)
-        history.append({"epoch": epoch, "train_loss": tl, "train_dice": td,
-                         "val_loss": vl, "val_dice": vd})
-
-        if cfg["early_stop_patience"] > 0 and patience_counter >= cfg["early_stop_patience"]:
-            print(f"\n  ⏹ Early stopping (patience={cfg['early_stop_patience']})")
-            break
-
-    pfx = cfg["ckpt_prefix"]
-    with open(f"{cfg['ckpt_dir']}/{pfx}_history.json", "w") as f:
-        json.dump(history, f, indent=2)
-
-    print(f"\n{'='*60}")
-    print(f"  🎉 {current_task} DONE — Best val dice: {best_metric:.4f}")
-    print(f"{'='*60}")
-
-    # ── Cleanup GPU/RAM for next task ──────────────────────────
-    del model, optimizer, scheduler, scaler, ema
-    del train_ds, val_ds, train_loader, val_loader
-    del all_records, train_records, val_records
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    time.sleep(2)
-    best_metric = 0.0
-    history     = []
-    cfg["resume_from"] = None
-    _MEAN = None   # reset cached normalize tensors
-    _STD  = None
-
-print(f"\n{'='*60}")
-print(f"  🏁 ALL SEGMENTATION TASKS COMPLETE")
-print(f"{'='*60}")
+# ─────────────────────────────────────────────────────────────
+#  Cleanup (free memory for next task)
+# ─────────────────────────────────────────────────────────────
+del model, optimizer, scheduler, ema, train_loader, val_loader, train_ds, val_ds
+import gc; gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+print(f"\n✅ {TASK} training complete. Best val dice: {best_dice:.4f}")

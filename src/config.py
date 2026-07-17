@@ -1,130 +1,134 @@
 """
 src/config.py
-Central configuration for UUSIVC 2026 competition-grade training.
-Every tweak is configurable from here. Override any value by setting
-globals before exec()ing a training script.
+UUSIVC 2026 — Master Configuration File (v2)
+
+HOW TO USE:
+    from src.config import CFG
+    # Modify any key before training starts
+    CFG["epochs"] = 80
+    CFG["resume_from"] = "/kaggle/working/checkpoints/seg_latest.pth"
 """
 
-import os
+CFG = {
+    # ══════════════════════════════════════════════════════
+    #  PATHS  (set at runtime in your notebook)
+    # ══════════════════════════════════════════════════════
+    "train_path": "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN",
+    "val_path":   "/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL",
+    "ckpt_dir":   "/kaggle/working/checkpoints",
 
-def get_cfg(task="seg"):
-    """Return a config dict. task = 'seg' | 'cls' | 'ceus_cls'"""
+    # ══════════════════════════════════════════════════════
+    #  MODEL ARCHITECTURE
+    # ══════════════════════════════════════════════════════
+    # Segmentation
+    "seg_encoder":        "efficientnet-b5",      # SMP encoder name
+    "seg_decoder":        "UnetPlusPlus",          # SMP decoder type: "Unet", "UnetPlusPlus", "FPN", "DeepLabV3Plus"
+    "seg_encoder_weights":"imagenet",
+    "seg_in_channels":    3,
+    "seg_num_classes":    1,                       # binary segmentation
+    "seg_dropout":        0.2,
 
-    cfg = {
-        # ── Paths ────────────────────────────────────────────
-        "train_root": os.environ.get("TRAIN_PATH",
-            "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN"),
-        "val_root": os.environ.get("VAL_PATH",
-            "/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL"),
-        "ckpt_dir": "/kaggle/working/checkpoints",
-        "preprocess_dir": "/kaggle/working/preprocessed",
+    # Classification
+    "cls_encoder":        "efficientnet-b5",      # timm model name or smp encoder
+    "cls_dropout":        0.3,
+    "cls_num_classes":    2,                       # binary classification
+    "cls_hidden_dim":     512,
+    "ceus_n_frames":      16,                      # frames to sample from CEUS video (was 8)
 
-        # ── Task ─────────────────────────────────────────────
-        "task": task,                     # "seg" | "cls" | "ceus_cls"
-        "seg_tasks": ["image_seg", "ceus_seg", "video_seg"],
-        "cls_tasks": ["image_cls"],
-        "ceus_cls_tasks": ["ceus_cls"],
+    # ══════════════════════════════════════════════════════
+    #  INPUT / RESOLUTION
+    # ══════════════════════════════════════════════════════
+    "img_size":      512,        # Resolution for image_seg (square crop/resize)
+    "ceus_seg_h":    256,        # CEUS seg height (native)
+    "ceus_seg_w":    512,        # CEUS seg width  (native)
+    "video_seg_h":   256,        # Video seg height (native)
+    "video_seg_w":   256,        # Video seg width  (native)
 
-        # ── Model ────────────────────────────────────────────
-        "encoder_name": "efficientnet-b5",
-        "encoder_weights": "imagenet",
-        "decoder_type": "UnetPlusPlus",   # "Unet" | "UnetPlusPlus" | "FPN" | "DeepLabV3Plus"
-        "in_channels": 3,
-        "seg_classes": 1,
-        "cls_classes": 2,
-        "dropout": 0.3,
-        "cls_backbone": "efficientnet_b5",  # timm model name for classification
+    # ══════════════════════════════════════════════════════
+    #  TRAINING HYPER-PARAMETERS
+    # ══════════════════════════════════════════════════════
+    "epochs":            60,
+    "batch_size":        8,
+    "grad_accum_steps":  4,          # Effective batch = batch_size × grad_accum_steps
+    "num_workers":       4,
+    "pin_memory":        True,
+    "seed":              42,
+    "val_split":         0.15,
 
-        # ── Resolution ───────────────────────────────────────
-        "img_size_seg": 512,              # for image_seg
-        "img_size_ceus_seg": (256, 512),  # (H, W) for ceus_seg — native resolution
-        "img_size_video_seg": 256,        # for video_seg
-        "img_size_cls": 384,              # for image_cls / ceus_cls
+    # Learning Rate
+    "lr":                1e-4,       # Decoder / head LR
+    "encoder_lr":        1e-5,       # Pretrained encoder LR (10× smaller)
+    "weight_decay":      1e-4,
+    "warmup_epochs":     5,          # Linear warmup from lr/10 to lr
 
-        # ── Training ─────────────────────────────────────────
-        "epochs": 50,
-        "batch_size": 8,
-        "grad_accum_steps": 4,            # effective batch = batch_size * grad_accum
-        "num_workers": 4,
-        "pin_memory": True,
-        "seed": 42,
-        "val_split": 0.15,
-        "early_stop_patience": 15,        # 0 = disabled
+    # Scheduler
+    "scheduler":         "cosine_warmrestart",  # "cosine" | "cosine_warmrestart" | "step"
+    "T_0":               10,         # cosine warm restart period (epochs)
+    "T_mult":            2,          # multiplier for next restart period
+    "eta_min":           1e-6,
 
-        # ── Optimizer ────────────────────────────────────────
-        "optimizer": "adamw",
-        "lr": 1e-4,
-        "encoder_lr": 1e-5,              # differential LR for pretrained encoder
-        "weight_decay": 1e-4,
+    # Regularisation
+    "label_smoothing":   0.1,        # For classification CrossEntropy
+    "mixup_alpha":       0.2,        # 0.0 to disable Mixup augmentation
+    "cutmix_alpha":      1.0,        # 0.0 to disable CutMix augmentation
+    "ema_decay":         0.999,      # Exponential Moving Average of weights
+    "grad_clip":         1.0,        # Max gradient norm (0 to disable)
 
-        # ── Scheduler ────────────────────────────────────────
-        "scheduler": "cosine_warm_restart",  # "cosine" | "cosine_warm_restart" | "onecycle"
-        "T_0": 10,
-        "T_mult": 2,
-        "eta_min": 1e-7,
-        "warmup_epochs": 3,
+    # ══════════════════════════════════════════════════════
+    #  LOSS FUNCTIONS
+    # ══════════════════════════════════════════════════════
+    # Segmentation loss: weighted sum of Dice + Focal + Boundary
+    "seg_dice_weight":     0.4,
+    "seg_focal_weight":    0.3,
+    "seg_boundary_weight": 0.3,
 
-        # ── Loss (Segmentation) ──────────────────────────────
-        "seg_loss": "dice_focal_boundary",  # "dice_focal" | "dice_focal_boundary"
-        "dice_weight": 0.35,
-        "focal_weight": 0.35,
-        "boundary_weight": 0.30,
-        "focal_gamma": 2.0,
-        "focal_alpha": 0.25,
+    # Classification loss: Focal + Label Smoothing
+    "cls_focal_gamma":   2.0,
+    "cls_focal_alpha":   0.25,       # Overridden per-organ by class weights
 
-        # ── Loss (Classification) ────────────────────────────
-        "cls_loss": "focal",               # "ce" | "focal"
-        "label_smoothing": 0.1,
-        "cls_focal_gamma": 2.0,
-        "use_class_weights": True,
+    # ══════════════════════════════════════════════════════
+    #  AMP / MEMORY OPTIMIZATION
+    # ══════════════════════════════════════════════════════
+    "use_amp":                  True,   # Mixed precision FP16 (saves 30-50% VRAM)
+    "gradient_checkpointing":   False,  # Save activation memory (slows training 20%)
 
-        # ── Augmentation ─────────────────────────────────────
-        "use_heavy_aug": True,
-        "mixup_alpha": 0.2,               # 0 = disabled
-        "cutmix_alpha": 1.0,              # 0 = disabled
-        "mixup_prob": 0.5,                # probability of applying mixup/cutmix per batch
+    # ══════════════════════════════════════════════════════
+    #  AUGMENTATION
+    # ══════════════════════════════════════════════════════
+    "aug_hflip_p":              0.5,
+    "aug_vflip_p":              0.3,
+    "aug_rotate_limit":         30,
+    "aug_shift_scale_rotate_p": 0.7,
+    "aug_elastic_p":            0.3,
+    "aug_grid_distort_p":       0.3,
+    "aug_clahe_p":              0.5,
+    "aug_brightness_p":         0.5,
+    "aug_gauss_noise_p":        0.3,
+    "aug_coarse_dropout_p":     0.3,
 
-        # ── Mixed Precision ──────────────────────────────────
-        "use_amp": True,
+    # ══════════════════════════════════════════════════════
+    #  CHECKPOINTING & RESUME
+    # ══════════════════════════════════════════════════════
+    "save_best":         True,   # Save best.pth when val metric improves
+    "save_latest":       True,   # Save latest.pth every epoch (for resume)
+    "resume_from":       None,   # Path to checkpoint to resume from (e.g. "latest.pth")
 
-        # ── Gradient Checkpointing ───────────────────────────
-        "gradient_checkpointing": False,   # set True to save VRAM (slower)
+    # ══════════════════════════════════════════════════════
+    #  LOGGING
+    # ══════════════════════════════════════════════════════
+    "log_steps":         25,     # Print step-level log every N steps
+    "log_vram":          True,   # Print VRAM usage in logs
 
-        # ── EMA ──────────────────────────────────────────────
-        "use_ema": True,
-        "ema_decay": 0.999,
-
-        # ── Checkpointing ────────────────────────────────────
-        "save_best": True,
-        "save_latest": True,
-        "resume_from": None,              # path to checkpoint to resume from
-
-        # ── CEUS Classification Specific ─────────────────────
-        "ceus_n_frames": 16,              # number of frames to sample (was 8)
-        "ceus_frame_size": 256,           # resize each frame to this
-
-        # ── CEUS Segmentation Specific ───────────────────────
-        "ceus_seg_frames": [3, 7, 11],    # frames to extract (multi-frame)
-
-        # ── Post-processing ──────────────────────────────────
-        "tta_enabled": False,             # enable during inference only
-        "tta_transforms": ["hflip", "vflip"],
-        "morphological_cleanup": True,
-        "min_component_size": 50,
-
-        # ── Logging ──────────────────────────────────────────
-        "log_every_n_batches": 50,        # print batch progress every N batches
-    }
-
-    return cfg
-
-
-def print_cfg(cfg):
-    """Pretty-print config."""
-    print("=" * 60)
-    print("  CONFIGURATION")
-    print("=" * 60)
-    max_key_len = max(len(k) for k in cfg)
-    for k, v in cfg.items():
-        print(f"  {k:{max_key_len}s} : {v}")
-    print("=" * 60)
+    # ══════════════════════════════════════════════════════
+    #  INFERENCE / POST-PROCESSING
+    # ══════════════════════════════════════════════════════
+    "seg_threshold":     0.5,    # Default sigmoid threshold
+    "tta_enabled":       True,   # Test-Time Augmentation
+    "tta_hflip":         True,
+    "tta_vflip":         True,
+    "tta_scale_075":     False,  # Multi-scale TTA (slower, better)
+    "tta_scale_125":     False,
+    "morph_cleanup":     True,   # Morphological post-processing
+    "morph_iterations":  2,
+    "keep_largest_cc":   True,   # Keep only largest connected component
+}
