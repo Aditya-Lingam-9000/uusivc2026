@@ -1,99 +1,85 @@
 """
-notebooks/train_cls_v2.py
-UUSIVC 2026 — Competition-Grade Classification Training (v2)
+notebooks/train_cls_v2.py  —  UUSIVC 2026 Classification Training v2
 
-Trains classification models:
-  - image_cls  (4 organs: Appendix, Breast, Liver, Prostate)
-  - ceus_cls   (4 organs: BreastCEUS, LiverCEUS, ProstateCEUS, ThyroidCEUS)
+RAM FIX: CEUS videos (25MB each) are pre-extracted to 16-frame .npy files
+         (~6MB each) ONCE before training. GPU then reads 6MB instead of 25MB,
+         reducing page-cache RAM from ~10GB to ~2.6GB.
 
-Key improvements over v1:
-  ✅ EfficientNet-B5 backbone (replaces ResNet-50)
-  ✅ Temporal attention pooling for CEUS (replaces simple averaging)
-  ✅ Focal Loss + Label Smoothing (handles class imbalance, LiverCEUS AUC fix)
-  ✅ WeightedRandomSampler (balanced batches per organ)
-  ✅ Mixup augmentation
-  ✅ Albumentations augmentation pipeline
-  ✅ Mixed Precision (AMP)
-  ✅ EMA model for validation
-  ✅ Resume from checkpoint
-  ✅ Per-25-step logs with VRAM + ETA
+KEY SETTINGS:
+  num_workers       = 2  (not 4 — fewer Python worker processes)
+  persistent_workers= False  (workers die between epochs, freeing RAM)
+  prefetch_factor   = 2  (minimal pre-fetch queue)
 
-HOW TO RUN on Kaggle:
-    !pip install segmentation-models-pytorch albumentations timm --quiet
-    !cd /kaggle/working && git clone https://github.com/Aditya-Lingam-9000/uusivc2026.git repo
-    import sys; sys.path.insert(0, '/kaggle/working/repo')
+HOW TO RUN:
     TRAIN_PATH = "/kaggle/input/.../TRAIN"
     VAL_PATH   = "/kaggle/input/.../VAL"
-
     TASK = "image_cls"   # or "ceus_cls"
     exec(open('/kaggle/working/repo/notebooks/train_cls_v2.py').read())
 
-    # Resume:
+    # Resume after timeout:
     CFG["resume_from"] = f"/kaggle/working/checkpoints/{TASK}_v2_latest.pth"
     exec(open('/kaggle/working/repo/notebooks/train_cls_v2.py').read())
 """
 
-import sys, os, json, random, time
+import sys, os, json, random, time, gc
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
+import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.amp import GradScaler, autocast
 
 # ── Force src reload ───────────────────────────────────────────
-for mod in list(sys.modules.keys()):
-    if mod.startswith("src"):
-        del sys.modules[mod]
+for _m in list(sys.modules.keys()):
+    if _m.startswith("src"):
+        del sys.modules[_m]
 
 # ── Config / Paths ─────────────────────────────────────────────
 TRAIN_PATH = globals().get("TRAIN_PATH", "/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN")
 VAL_PATH   = globals().get("VAL_PATH",   "/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL")
-TASK       = globals().get("TASK", "image_cls")   # "image_cls" | "ceus_cls"
+TASK       = globals().get("TASK", "image_cls")
 
 from src.config import CFG
 CFG["train_path"] = TRAIN_PATH
 CFG["val_path"]   = VAL_PATH
 CFG["ckpt_dir"]   = "/kaggle/working/checkpoints"
+os.makedirs(CFG["ckpt_dir"], exist_ok=True)   # ← CRITICAL: create before any save
 
-# ── Task-specific overrides ─────────────────────────────────────
+# ── Task-specific settings ──────────────────────────────────────
 if TASK == "image_cls":
-    CFG["img_size"]    = 512
-    CFG["batch_size"]  = 16
-    CFG["grad_accum_steps"] = 2   # Effective batch = 32
-    CFG["epochs"]      = 50
-    CFG["ceus_n_frames"] = 8      # not used for image_cls
+    CFG["img_size"]         = 512
+    CFG["batch_size"]       = 24    # increased from 16
+    CFG["grad_accum_steps"] = 2     # effective = 48
+    CFG["epochs"]           = 50
 elif TASK == "ceus_cls":
-    CFG["img_size"]    = 256
-    CFG["batch_size"]  = 4        # CEUS videos are large
-    CFG["grad_accum_steps"] = 8   # Effective batch = 32
-    CFG["epochs"]      = 40
-    CFG["ceus_n_frames"] = 16
+    CFG["img_size"]         = 256
+    CFG["batch_size"]       = 8     # safe with pre-extracted 6MB files
+    CFG["grad_accum_steps"] = 4     # effective = 32
+    CFG["epochs"]           = 40
+    CFG["ceus_n_frames"]    = 16
 
 CKPT_PREFIX = f"{TASK}_v2"
+CKPT_DIR    = CFG["ckpt_dir"]
 
 # ── Device ─────────────────────────────────────────────────────
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {DEVICE}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
     if torch.cuda.device_count() > 1:
-        print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
-
+        print(f"DataParallel: {torch.cuda.device_count()} GPUs")
 torch.manual_seed(CFG["seed"]); random.seed(CFG["seed"]); np.random.seed(CFG["seed"])
 
 # ── Imports ────────────────────────────────────────────────────
 from src.dataset import get_partition_root
 from src.models_v2 import build_cls_model, build_ceus_cls_model, EMA, build_optimizer, build_scheduler
-from src.losses_v2 import FocalCELoss, build_cls_losses, get_organ_cls_weights
-from src.augmentations_v2 import (
-    get_cls_transforms, apply_cls_transform,
-    mixup_batch, mixup_criterion, ALBUMENTATIONS_AVAILABLE
-)
-from src.trainer import Trainer, get_vram_info, fmt_vram, fmt_time, accuracy
-
+from src.losses_v2 import FocalCELoss
+from src.augmentations_v2 import get_cls_transforms, apply_cls_transform, mixup_batch, mixup_criterion, ALBUMENTATIONS_AVAILABLE
+from src.trainer import fmt_vram, fmt_time, accuracy
 print("✅ All imports OK")
 
 # ─────────────────────────────────────────────────────────────
@@ -122,6 +108,45 @@ for organ, counts in sorted(organ_counts.items()):
           f"total={total:4d}  ratio={ratio:.2f}:1")
 
 # ─────────────────────────────────────────────────────────────
+#  CEUS PRE-EXTRACTION (THE RAM FIX)
+#  Extracts 16 frames per video ONCE, saves as (16, 256, 512, 3) uint8
+#  File size: 6.3MB vs original 25MB → 4× RAM reduction
+#  Total disk: ~504 × 6.3MB = ~3.2GB (within 19.5GB Kaggle limit)
+# ─────────────────────────────────────────────────────────────
+CEUS_PREP_DIR = Path("/kaggle/working/preprocessed_ceus_cls")
+
+def preextract_ceus(samples, train_root, val_root, prep_dir, n_frames=16):
+    prep_dir = Path(prep_dir)
+    prep_dir.mkdir(parents=True, exist_ok=True)
+    T_total = 64
+    frame_idx = np.linspace(0, T_total - 1, n_frames).astype(int)
+    result = []
+    n_extracted = 0
+
+    for i, s in enumerate(samples):
+        pr  = get_partition_root(Path(train_root), Path(val_root) if val_root else None,
+                                 s["data_partition_group"])
+        sid = s["sample_id"]
+        save_path = prep_dir / f"{sid}.npy"
+
+        if not save_path.exists():
+            video = np.load(pr / s["input_path_relative"])  # (64,256,512,3) uint8
+            frames = video[frame_idx]                        # (16,256,512,3) uint8
+            np.save(save_path, frames)
+            n_extracted += 1
+
+        result.append({
+            "frames_path": str(save_path),
+            "label":  s.get("class_label_index", 0),
+            "organ":  s["organ"],
+        })
+        if (i + 1) % 100 == 0:
+            print(f"  {i+1}/{len(samples)} videos ready (new extractions: {n_extracted})")
+
+    print(f"Pre-extraction done. {n_extracted} new files. {len(result)} total samples.")
+    return result
+
+# ─────────────────────────────────────────────────────────────
 #  Dataset classes
 # ─────────────────────────────────────────────────────────────
 from PIL import Image as PILImage
@@ -138,134 +163,128 @@ class ImageClsDataset(Dataset):
     def __getitem__(self, idx):
         s  = self.samples[idx]
         pr = get_partition_root(self.train_root, self.val_root, s["data_partition_group"])
-        img_path = pr / s["input_path_relative"]
-        img_np   = np.array(PILImage.open(img_path).convert("RGB"))   # (H, W, 3) uint8
-        img_t    = apply_cls_transform(self.transform, img_np)
-        label    = s.get("class_label_index", 0)
-        return {
-            "input": img_t,
-            "label": torch.tensor(label, dtype=torch.long),
-            "organ": s["organ"],
-        }
+        img_np = np.array(PILImage.open(pr / s["input_path_relative"]).convert("RGB"))
+        img_t  = apply_cls_transform(self.transform, img_np)
+        label  = s.get("class_label_index", 0)
+        return {"input": img_t, "label": torch.tensor(label, dtype=torch.long), "organ": s["organ"]}
 
 
 class CEUSClsDataset(Dataset):
-    def __init__(self, samples, train_root, val_root, n_frames=16):
-        self.samples    = samples
-        self.train_root = Path(train_root)
-        self.val_root   = Path(val_root) if val_root else None
-        self.n_frames   = n_frames
+    """
+    Loads pre-extracted (16, 256, 512, 3) uint8 frames.
+    File size: 6.3MB vs 25MB original → keeps RAM under 3GB page cache.
+    """
+    def __init__(self, sample_list):
+        self.sample_list = sample_list
 
-    def __len__(self): return len(self.samples)
+    def __len__(self): return len(self.sample_list)
 
     def __getitem__(self, idx):
-        s  = self.samples[idx]
-        pr = get_partition_root(self.train_root, self.val_root, s["data_partition_group"])
-        npy_path = pr / s["input_path_relative"]
-
-        video = np.load(npy_path)                               # (64, 256, 512, 3) uint8
-        video_t = torch.tensor(video, dtype=torch.float32)
-        video_t = video_t.permute(0, 3, 1, 2) / 255.0         # (64, 3, 256, 512)
-
-        label = s.get("class_label_index", 0)
+        item   = self.sample_list[idx]
+        frames = np.load(item["frames_path"])                          # (16,256,512,3) uint8
+        frames_t = torch.from_numpy(frames).permute(0, 3, 1, 2).float() / 255.0  # (16,3,256,512)
         return {
-            "input": video_t,
-            "label": torch.tensor(label, dtype=torch.long),
-            "organ": s["organ"],
+            "input": frames_t,
+            "label": torch.tensor(item["label"], dtype=torch.long),
+            "organ": item["organ"],
         }
 
-
 # ─────────────────────────────────────────────────────────────
-#  Train/Val split (stratified by organ AND class)
+#  Stratified train/val split
 # ─────────────────────────────────────────────────────────────
 random.seed(CFG["seed"])
 strata = defaultdict(list)
 for i, s in enumerate(task_samples):
-    key = (s["organ"], s.get("class_label_index", 0))
-    strata[key].append(i)
+    strata[(s["organ"], s.get("class_label_index", 0))].append(i)
 
-train_indices, val_indices = [], []
-for key, indices in strata.items():
+train_idx, val_idx = [], []
+for indices in strata.values():
     random.shuffle(indices)
     n_val = max(1, int(len(indices) * CFG["val_split"]))
-    val_indices.extend(indices[:n_val])
-    train_indices.extend(indices[n_val:])
+    val_idx.extend(indices[:n_val])
+    train_idx.extend(indices[n_val:])
 
-random.shuffle(train_indices)
-train_s = [task_samples[i] for i in train_indices]
-val_s   = [task_samples[i] for i in val_indices]
+random.shuffle(train_idx)
+train_s = [task_samples[i] for i in train_idx]
+val_s   = [task_samples[i] for i in val_idx]
 print(f"\nTrain: {len(train_s)}  |  Val: {len(val_s)}")
 
 # ─────────────────────────────────────────────────────────────
-#  Build datasets
+#  Build datasets and loaders
 # ─────────────────────────────────────────────────────────────
+NW = 2   # ← KEY: 2 workers max (each worker = ~1GB Python overhead)
+         #         4 workers = 4GB overhead before loading any data!
+
 if TASK == "image_cls":
     train_tf = get_cls_transforms(CFG, mode="train")
     val_tf   = get_cls_transforms(CFG, mode="val")
     train_ds = ImageClsDataset(train_s, TRAIN_PATH, VAL_PATH, train_tf)
     val_ds   = ImageClsDataset(val_s,   TRAIN_PATH, VAL_PATH, val_tf)
 else:  # ceus_cls
-    train_ds = CEUSClsDataset(train_s, TRAIN_PATH, VAL_PATH, n_frames=CFG["ceus_n_frames"])
-    val_ds   = CEUSClsDataset(val_s,   TRAIN_PATH, VAL_PATH, n_frames=CFG["ceus_n_frames"])
+    print("\n📦 Pre-extracting CEUS frames (runs once, reuses on resume)...")
+    all_preext = preextract_ceus(task_samples, TRAIN_PATH, VAL_PATH, CEUS_PREP_DIR,
+                                 n_frames=CFG["ceus_n_frames"])
+    # Map back to train/val splits using sample_id
+    sid_to_item = {s["sample_id"]: item
+                   for s, item in zip(task_samples, all_preext)}
+    train_pe = [sid_to_item[task_samples[i]["sample_id"]] for i in train_idx]
+    val_pe   = [sid_to_item[task_samples[i]["sample_id"]] for i in val_idx]
+    train_ds = CEUSClsDataset(train_pe)
+    val_ds   = CEUSClsDataset(val_pe)
 
-# ── WeightedRandomSampler for balanced batches ─────────────────
-# Each sample gets weight proportional to 1 / class_count_in_organ
-organ_class_counts = defaultdict(lambda: defaultdict(int))
+# WeightedRandomSampler (balanced batches per organ)
+organ_class_cnt = defaultdict(lambda: defaultdict(int))
 for s in train_s:
-    organ_class_counts[s["organ"]][s.get("class_label_index", 0)] += 1
+    organ_class_cnt[s["organ"]][s.get("class_label_index", 0)] += 1
 
 sample_weights = []
 for s in train_s:
-    organ = s["organ"]
-    label = s.get("class_label_index", 0)
-    organ_total = sum(organ_class_counts[organ].values())
-    w = organ_total / (2.0 * max(organ_class_counts[organ][label], 1))
-    sample_weights.append(w)
+    org, lbl  = s["organ"], s.get("class_label_index", 0)
+    org_total = sum(organ_class_cnt[org].values())
+    sample_weights.append(org_total / (2.0 * max(organ_class_cnt[org][lbl], 1)))
 
-sampler = WeightedRandomSampler(
-    weights=sample_weights,
-    num_samples=len(sample_weights),
-    replacement=True,
-)
+sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
-# ── Data Loaders ───────────────────────────────────────────────
-nw = CFG["num_workers"] if TASK == "image_cls" else 2
 train_loader = DataLoader(
-    train_ds, batch_size=CFG["batch_size"],
+    train_ds,
+    batch_size=CFG["batch_size"],
     sampler=sampler,
-    num_workers=nw, pin_memory=CFG["pin_memory"],
+    num_workers=NW,
+    pin_memory=True,
+    persistent_workers=False,   # ← KEY: workers die after each epoch → free RAM
+    prefetch_factor=2,
 )
 val_loader = DataLoader(
-    val_ds, batch_size=CFG["batch_size"] * 2, shuffle=False,
-    num_workers=nw, pin_memory=CFG["pin_memory"],
+    val_ds,
+    batch_size=CFG["batch_size"] * 2,
+    shuffle=False,
+    num_workers=NW,
+    pin_memory=True,
+    persistent_workers=False,
+    prefetch_factor=2,
 )
 print(f"Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
 print(f"Effective batch size: {CFG['batch_size'] * CFG['grad_accum_steps']}")
 
 # ─────────────────────────────────────────────────────────────
-#  Build Model + Loss
+#  Model + Loss
 # ─────────────────────────────────────────────────────────────
-if TASK == "image_cls":
-    model = build_cls_model(CFG)
-else:
-    model = build_ceus_cls_model(CFG)
-
+model = build_cls_model(CFG) if TASK == "image_cls" else build_ceus_cls_model(CFG)
 if torch.cuda.device_count() > 1:
     model = nn.DataParallel(model)
 model = model.to(DEVICE)
 print(f"\nModel params: {sum(p.numel() for p in model.parameters()):,}")
 
-# Combined class weights across all organs in this task
-# Use macro-average of per-organ weights
-all_organs = list(organ_class_counts.keys())
+# Global class weights
 total_counts = [0, 0]
 for s in train_s:
     total_counts[s.get("class_label_index", 0)] += 1
-grand_total = sum(total_counts)
-w0 = grand_total / (2.0 * max(total_counts[0], 1))
-w1 = grand_total / (2.0 * max(total_counts[1], 1))
-global_weights = torch.tensor([w0, w1], dtype=torch.float32, device=DEVICE)
-print(f"Global class weights: [{w0:.3f}, {w1:.3f}]  (class counts: {total_counts})")
+gt = sum(total_counts)
+global_weights = torch.tensor(
+    [gt / (2.0 * max(total_counts[0], 1)), gt / (2.0 * max(total_counts[1], 1))],
+    dtype=torch.float32, device=DEVICE
+)
+print(f"Class weights: {global_weights.tolist()}  counts: {total_counts}")
 
 criterion = FocalCELoss(
     gamma=CFG["cls_focal_gamma"],
@@ -273,30 +292,16 @@ criterion = FocalCELoss(
     label_smoothing=CFG["label_smoothing"],
 ).to(DEVICE)
 
-# ─────────────────────────────────────────────────────────────
-#  Optimizer / Scheduler / EMA
-# ─────────────────────────────────────────────────────────────
 raw_model = model.module if hasattr(model, "module") else model
-optimizer  = build_optimizer(raw_model, CFG)
-scheduler  = build_scheduler(optimizer, CFG)
-ema        = EMA(raw_model, decay=CFG["ema_decay"])
+optimizer = build_optimizer(raw_model, CFG)
+scheduler = build_scheduler(optimizer, CFG)
+ema       = EMA(raw_model, decay=CFG["ema_decay"])
+scaler    = GradScaler('cuda', enabled=CFG["use_amp"])
 
 # ─────────────────────────────────────────────────────────────
-#  Custom training loop (with Mixup)
+#  Resume
 # ─────────────────────────────────────────────────────────────
-from torch.cuda.amp import GradScaler, autocast
-
-scaler     = GradScaler(enabled=CFG["use_amp"])
-ckpt_dir   = CFG["ckpt_dir"]
-epochs     = CFG["epochs"]
-accum_steps= CFG["grad_accum_steps"]
-log_steps  = CFG["log_steps"]
-mixup_a    = CFG.get("mixup_alpha", 0.2)
-best_acc   = 0.0
-history    = []
-start_epoch= 1
-
-# Resume
+best_acc, history, start_epoch = 0.0, [], 1
 resume_path = CFG.get("resume_from")
 if resume_path and os.path.exists(resume_path):
     ckpt = torch.load(resume_path, map_location=DEVICE)
@@ -309,55 +314,60 @@ if resume_path and os.path.exists(resume_path):
     history     = ckpt.get("history", [])
     if "ema_state_dict" in ckpt:
         ema.load_state_dict(ckpt["ema_state_dict"])
-    print(f"✅ Resumed from epoch {start_epoch-1} | best_acc={best_acc:.4f}")
+    print(f"✅ Resumed epoch {start_epoch-1} | best_acc={best_acc:.4f}")
+
+epochs     = CFG["epochs"]
+accum_steps= CFG["grad_accum_steps"]
+log_steps  = CFG["log_steps"]
+mixup_a    = CFG.get("mixup_alpha", 0.2)
+warmup_e   = CFG.get("warmup_epochs", 5)
 
 print(f"\n{'='*65}")
-print(f"  Training: {CKPT_PREFIX}  |  epochs {start_epoch}→{epochs}")
-print(f"  AMP={CFG['use_amp']}  |  GradAccum={accum_steps}  |  "
-      f"EffBatch={CFG['batch_size']*accum_steps}")
-print(f"  Mixup alpha={mixup_a}  |  WarmupEpochs={CFG['warmup_epochs']}")
+print(f"  {CKPT_PREFIX}  |  epochs {start_epoch}→{epochs}")
+print(f"  AMP={CFG['use_amp']}  |  EffBatch={CFG['batch_size']*accum_steps}")
+print(f"  Workers={NW}  |  persistent_workers=False  |  prefetch=2")
 print(f"  VRAM at start: {fmt_vram()}")
 print(f"{'='*65}\n")
 
+# ─────────────────────────────────────────────────────────────
+#  Training Loop
+# ─────────────────────────────────────────────────────────────
 for epoch in range(start_epoch, epochs + 1):
     t0 = time.time()
 
     # Warmup LR
-    warmup = CFG.get("warmup_epochs", 5)
-    if epoch <= warmup:
-        factor = epoch / max(warmup, 1)
-        base_lr = CFG["lr"]
-        enc_lr  = CFG["encoder_lr"]
+    if epoch <= warmup_e:
+        factor = epoch / max(warmup_e, 1)
         for i, pg in enumerate(optimizer.param_groups):
-            pg["lr"] = (enc_lr if i == 0 and len(optimizer.param_groups) > 1 else base_lr) * factor
+            base = CFG["encoder_lr"] if i == 0 and len(optimizer.param_groups) > 1 else CFG["lr"]
+            pg["lr"] = base * factor
 
-    # ── Train epoch ────────────────────────────────────────────
+    # ── Train ───────────────────────────────────────────────
     model.train()
     loss_sum, correct, total = 0.0, 0, 0
     optimizer.zero_grad(set_to_none=True)
-    n_total_steps = len(train_loader)
+    n_steps = len(train_loader)
 
     for step, batch in enumerate(train_loader, 1):
-        t_step = time.time()
-        imgs   = batch["input"].to(DEVICE)
-        labels = batch["label"].to(DEVICE)
+        imgs   = batch["input"].to(DEVICE, non_blocking=True)
+        labels = batch["label"].to(DEVICE, non_blocking=True)
         bs     = imgs.size(0)
 
-        # Mixup (only for image_cls — not for CEUS videos which are large)
-        use_mixup = TASK == "image_cls" and mixup_a > 0 and random.random() < 0.5
-        if use_mixup:
+        # Mixup (image_cls only — CEUS videos are large, skip for memory)
+        use_mix = (TASK == "image_cls" and mixup_a > 0 and random.random() < 0.5)
+        if use_mix:
             imgs, (la, lb, lam) = mixup_batch(imgs, labels, alpha=mixup_a)
 
-        with autocast(enabled=CFG["use_amp"]):
+        with autocast('cuda', enabled=CFG["use_amp"]):
             logits = model(imgs)
-            if use_mixup:
+            if use_mix:
                 loss = mixup_criterion(criterion, logits, la, lb, lam) / accum_steps
             else:
                 loss = criterion(logits, labels) / accum_steps
 
         scaler.scale(loss).backward()
 
-        if step % accum_steps == 0 or step == n_total_steps:
+        if step % accum_steps == 0 or step == n_steps:
             if CFG["grad_clip"] > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), CFG["grad_clip"])
@@ -368,63 +378,51 @@ for epoch in range(start_epoch, epochs + 1):
 
         with torch.no_grad():
             loss_sum += loss.item() * accum_steps * bs
-            preds     = logits.argmax(dim=1)
-            correct  += (preds == labels).sum().item()
+            correct  += (logits.argmax(1) == labels).sum().item()
             total    += bs
 
-        # Per-step logging
-        if step % log_steps == 0 or step == n_total_steps:
-            t_elapsed = time.time() - t0
-            eta_epoch = (n_total_steps - step) * (t_elapsed / step)
-            eta_total = (epochs - epoch) * (t_elapsed / step * n_total_steps)
-            lr_str = "/".join(f"{pg['lr']:.2e}" for pg in optimizer.param_groups)
-            print(
-                f"    [E{epoch:02d} S{step:04d}/{n_total_steps}]  "
-                f"loss={loss_sum/max(total,1):.4f}  acc={correct/max(total,1):.4f}  "
-                f"|  LR: {lr_str}  "
-                f"|  ETA_epoch: {fmt_time(eta_epoch)}  "
-                f"|  ETA_total: {fmt_time(eta_total)}  "
-                f"|  VRAM: {fmt_vram()}"
-            )
+        if step % log_steps == 0 or step == n_steps:
+            t_el  = time.time() - t0
+            eta_e = (n_steps - step) * (t_el / step)
+            eta_t = (epochs - epoch) * (t_el / step * n_steps)
+            lr_s  = "/".join(f"{pg['lr']:.2e}" for pg in optimizer.param_groups)
+            print(f"    [E{epoch:02d} S{step:04d}/{n_steps}]  "
+                  f"loss={loss_sum/max(total,1):.4f}  acc={correct/max(total,1):.4f}  "
+                  f"|  LR:{lr_s}  |  ETA_epoch:{fmt_time(eta_e)}  "
+                  f"|  ETA_total:{fmt_time(eta_t)}  |  VRAM:{fmt_vram()}")
 
     scheduler.step(epoch)
     train_loss = loss_sum / max(total, 1)
     train_acc  = correct / max(total, 1)
 
-    # ── Val epoch (using EMA model) ─────────────────────────────
+    # ── Validate (EMA model) ────────────────────────────────
     ema.shadow.eval()
-    val_loss_sum, val_correct, val_total = 0.0, 0, 0
-    organ_correct = defaultdict(int)
-    organ_total   = defaultdict(int)
+    vl_sum, vc, vt = 0.0, 0, 0
+    org_c, org_t   = defaultdict(int), defaultdict(int)
 
     with torch.no_grad():
         for batch in val_loader:
-            imgs   = batch["input"].to(DEVICE)
-            labels = batch["label"].to(DEVICE)
-            organs = batch["organ"]
-
-            with autocast(enabled=CFG["use_amp"]):
+            imgs   = batch["input"].to(DEVICE, non_blocking=True)
+            labels = batch["label"].to(DEVICE, non_blocking=True)
+            with autocast('cuda', enabled=CFG["use_amp"]):
                 logits = ema.shadow(imgs)
-                loss_v = criterion(logits, labels)
+                vl_sum += criterion(logits, labels).item() * imgs.size(0)
+            preds = logits.argmax(1)
+            mask  = (preds == labels)
+            vc   += mask.sum().item()
+            vt   += imgs.size(0)
+            for i, org in enumerate(batch["organ"]):
+                org_t[org] += 1
+                org_c[org] += mask[i].item()
 
-            val_loss_sum += loss_v.item() * imgs.size(0)
-            preds = logits.argmax(dim=1)
-            correct_mask = (preds == labels)
-            val_correct += correct_mask.sum().item()
-            val_total   += imgs.size(0)
-            for i, org in enumerate(organs):
-                organ_total[org]   += 1
-                organ_correct[org] += correct_mask[i].item()
-
-    val_acc  = val_correct / max(val_total, 1)
-    val_loss = val_loss_sum / max(val_total, 1)
+    val_acc  = vc / max(vt, 1)
+    val_loss = vl_sum / max(vt, 1)
     t_epoch  = time.time() - t0
-    eta_remain = (epochs - epoch) * t_epoch
     is_best  = val_acc > best_acc
     if is_best:
         best_acc = val_acc
 
-    # Save checkpoints
+    # Save
     lr_str = "/".join(f"{pg['lr']:.2e}" for pg in optimizer.param_groups)
     ckpt_data = {
         "epoch": epoch, "best_metric": best_acc,
@@ -435,44 +433,36 @@ for epoch in range(start_epoch, epochs + 1):
         "ema_state_dict":       ema.state_dict(),
         "history":              history,
     }
-    torch.save(ckpt_data, f"{ckpt_dir}/{CKPT_PREFIX}_latest.pth")
+    torch.save(ckpt_data, f"{CKPT_DIR}/{CKPT_PREFIX}_latest.pth")
     if is_best:
-        torch.save(ckpt_data, f"{ckpt_dir}/{CKPT_PREFIX}_best.pth")
+        torch.save(ckpt_data, f"{CKPT_DIR}/{CKPT_PREFIX}_best.pth")
 
-    # Epoch summary
     history.append({"epoch": epoch, "train_loss": train_loss, "train_acc": train_acc,
                     "val_loss": val_loss, "val_acc": val_acc})
 
     print(f"\n{'─'*65}")
-    print(f"  [Epoch {epoch:02d}/{epochs}]  time={fmt_time(t_epoch)}  "
-          f"ETA_total={fmt_time(eta_remain)}  LR={lr_str}")
-    print(f"  Train  —  loss={train_loss:.4f}  acc={train_acc:.4f}")
-    print(f"  Val    —  loss={val_loss:.4f}  acc={val_acc:.4f}  "
+    print(f"  [E{epoch:02d}/{epochs}]  time={fmt_time(t_epoch)}  "
+          f"ETA={fmt_time((epochs-epoch)*t_epoch)}  LR={lr_str}")
+    print(f"  Train: loss={train_loss:.4f}  acc={train_acc:.4f}")
+    print(f"  Val:   loss={val_loss:.4f}  acc={val_acc:.4f}  "
           f"{'← 💾 BEST' if is_best else f'(best={best_acc:.4f})'}")
     print(f"  VRAM: {fmt_vram()}")
-    print("  Per-organ val accuracy:")
-    for org in sorted(organ_total):
-        a = organ_correct[org] / max(organ_total[org], 1)
-        print(f"    {org:20s}: {a:.4f}  ({organ_correct[org]}/{organ_total[org]})")
+    print("  Per-organ val:")
+    for org in sorted(org_t):
+        a = org_c[org] / max(org_t[org], 1)
+        print(f"    {org:20s}: {a:.4f}  ({org_c[org]}/{org_t[org]})")
     print(f"{'─'*65}")
 
-# ─────────────────────────────────────────────────────────────
-#  Save history JSON
-# ─────────────────────────────────────────────────────────────
-import json as _json
-with open(f"{ckpt_dir}/{CKPT_PREFIX}_history.json", "w") as f:
-    _json.dump(history, f, indent=2)
+    # ── Free page cache between epochs ─────────────────────
+    gc.collect()
 
+# ─────────────────────────────────────────────────────────────
 print(f"\n{'='*65}")
-print(f"✅ {TASK} Training Complete!")
-print(f"   Best val accuracy : {best_acc:.4f}")
-print(f"   Checkpoints       : {ckpt_dir}/{CKPT_PREFIX}_best.pth")
+print(f"✅ {TASK} Done! best_acc={best_acc:.4f}")
+print(f"   {CKPT_DIR}/{CKPT_PREFIX}_best.pth")
 print(f"{'='*65}")
 
-# ─────────────────────────────────────────────────────────────
-#  Cleanup
-# ─────────────────────────────────────────────────────────────
 del model, optimizer, scheduler, ema, train_loader, val_loader, train_ds, val_ds
-import gc; gc.collect()
+gc.collect()
 if torch.cuda.is_available():
     torch.cuda.empty_cache()

@@ -58,23 +58,24 @@ from src.config import CFG
 CFG["train_path"] = TRAIN_PATH
 CFG["val_path"]   = VAL_PATH
 CFG["ckpt_dir"]   = "/kaggle/working/checkpoints"
+os.makedirs(CFG["ckpt_dir"], exist_ok=True)   # ← Create BEFORE any save
 
 # ── Task-specific overrides ─────────────────────────────────────
 if TASK == "image_seg":
-    CFG["img_size"]    = 512
-    CFG["batch_size"]  = 4
-    CFG["grad_accum_steps"] = 8     # Effective batch = 32
-    CFG["epochs"]      = 60
+    CFG["img_size"]         = 512
+    CFG["batch_size"]       = 8    # increased from 4 (AMP+UNet++ fits on T4)
+    CFG["grad_accum_steps"] = 4    # effective = 32
+    CFG["epochs"]           = 60
 elif TASK == "ceus_seg":
-    CFG["img_size"]    = 256        # Height — width will be 512
-    CFG["batch_size"]  = 8
-    CFG["grad_accum_steps"] = 4
-    CFG["epochs"]      = 50
+    CFG["img_size"]         = 256
+    CFG["batch_size"]       = 12   # increased from 8
+    CFG["grad_accum_steps"] = 3    # effective = 36
+    CFG["epochs"]           = 50
 elif TASK == "video_seg":
-    CFG["img_size"]    = 256
-    CFG["batch_size"]  = 16
-    CFG["grad_accum_steps"] = 2
-    CFG["epochs"]      = 40
+    CFG["img_size"]         = 256
+    CFG["batch_size"]       = 28   # increased from 16 (pre-extracted 2D frames are tiny)
+    CFG["grad_accum_steps"] = 2    # effective = 56
+    CFG["epochs"]           = 40
 
 CKPT_PREFIX = f"{TASK}_v2"
 
@@ -200,14 +201,11 @@ class VideoSegDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.frame_list[idx]
-        frame    = np.load(item["img_path"])    # (256, 256) float [0,255]
-        mask_raw = np.load(item["mask_path"])   # (256, 256) float {0,255}
-
+        frame    = np.load(item["img_path"])    # (256, 256) uint8
+        mask_raw = np.load(item["mask_path"])   # (256, 256) uint8 {0,1}
         # Convert to HWC uint8 for albumentations
-        frame_u8 = np.clip(frame, 0, 255).astype(np.uint8)
-        frame_rgb = np.stack([frame_u8, frame_u8, frame_u8], axis=2)   # (H,W,3)
-        mask_u8   = (mask_raw > 0.5).astype(np.uint8) * 255
-
+        frame_rgb = np.stack([frame, frame, frame], axis=2)   # (H,W,3) uint8
+        mask_u8   = (mask_raw > 0).astype(np.uint8) * 255
         img_t, mask_t = apply_seg_transform(self.transform, frame_rgb, mask_u8)
         return {"input": img_t, "mask": mask_t, "organ": "Cardiac"}
 
@@ -238,8 +236,9 @@ def preextract_video_frames(task_samples, train_root, val_root, preprocess_dir):
                     if video is None:
                         video = np.load(npy_path)  # (3, T, 256, 256) float
                     frame = video[0, fidx]  # (256, 256) float
-                    np.save(img_p, frame.astype(np.float32))
-                    np.save(mask_p, mask_arr.astype(np.float32))
+                    # Save as uint8 to halve disk usage (float32=262KB vs uint8=65KB)
+                    np.save(img_p, np.clip(frame, 0, 255).astype(np.uint8))
+                    np.save(mask_p, (mask_arr > 127).astype(np.uint8))
                 frame_list.append({"img_path": str(img_p), "mask_path": str(mask_p),
                                    "sample_id": sid})
         except Exception as e:
@@ -290,14 +289,21 @@ elif TASK == "video_seg":
 
 print(f"\nTrain: {len(train_ds)}  |  Val: {len(val_ds)}")
 
+# DataLoader settings: NW=2 (not 4) to reduce Python worker overhead
+# Each worker process uses ~1-2GB RAM regardless of data size!
+# persistent_workers=False: workers die between epochs, freeing RAM
+# prefetch_factor=2: minimal pre-fetch queue to cap RAM
+NW = 2  # KEY: 2 workers = ~2-4GB overhead; 4 workers = ~4-8GB overhead
+
 train_loader = DataLoader(
     train_ds, batch_size=CFG["batch_size"], shuffle=True,
-    num_workers=CFG["num_workers"], pin_memory=CFG["pin_memory"],
-    drop_last=True,
+    num_workers=NW, pin_memory=True, drop_last=True,
+    persistent_workers=False, prefetch_factor=2,
 )
 val_loader = DataLoader(
     val_ds, batch_size=CFG["batch_size"] * 2, shuffle=False,
-    num_workers=CFG["num_workers"], pin_memory=CFG["pin_memory"],
+    num_workers=NW, pin_memory=True,
+    persistent_workers=False, prefetch_factor=2,
 )
 print(f"Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
 print(f"Effective batch size: {CFG['batch_size'] * CFG['grad_accum_steps']}")

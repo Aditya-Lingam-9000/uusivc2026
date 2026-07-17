@@ -27,7 +27,7 @@ from collections import defaultdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 
 # ─────────────────────────────────────────────────────────────
@@ -124,7 +124,7 @@ class Trainer:
         self.grad_clip   = cfg.get("grad_clip", 1.0)
         self.log_vram    = cfg.get("log_vram", True)
 
-        self.scaler = GradScaler(enabled=self.use_amp)
+        self.scaler = GradScaler('cuda', enabled=self.use_amp)
         os.makedirs(self.ckpt_dir, exist_ok=True)
 
         # State for resume
@@ -212,7 +212,7 @@ class Trainer:
                 masks = batch["mask"].to(self.device)
                 bs    = imgs.size(0)
 
-                with autocast(enabled=self.use_amp):
+                with autocast('cuda', enabled=self.use_amp):
                     logits = self.model(imgs)
                     if logits.shape[2:] != masks.shape[2:]:
                         logits = F.interpolate(logits, size=masks.shape[2:],
@@ -237,7 +237,7 @@ class Trainer:
                 labels = batch["label"].to(self.device)
                 bs     = imgs.size(0)
 
-                with autocast(enabled=self.use_amp):
+                with autocast('cuda', enabled=self.use_amp):
                     logits = self.model(imgs)
                     loss_out = self.criterion(logits, labels)
                     if isinstance(loss_out, tuple):
@@ -320,7 +320,7 @@ class Trainer:
                     masks = batch["mask"].to(self.device)
                     bs    = imgs.size(0)
 
-                    with autocast(enabled=self.use_amp):
+                    with autocast('cuda', enabled=self.use_amp):
                         logits = eval_model(imgs)
                         if logits.shape[2:] != masks.shape[2:]:
                             logits = F.interpolate(logits, size=masks.shape[2:],
@@ -336,7 +336,7 @@ class Trainer:
                     labels = batch["label"].to(self.device)
                     bs     = imgs.size(0)
 
-                    with autocast(enabled=self.use_amp):
+                    with autocast('cuda', enabled=self.use_amp):
                         logits = eval_model(imgs)
                         loss_out = self.criterion(logits, labels)
                         loss = loss_out[0] if isinstance(loss_out, tuple) else loss_out
