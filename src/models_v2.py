@@ -15,7 +15,7 @@ def build_seg_model_v2(cfg):
 class ClsModelV2(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        backbone_name = cfg.get("cls_backbone", "efficientnet_b5")
+        backbone_name = cfg.get("cls_backbone", "efficientnet_b5").replace("-", "_")
         pretrained = cfg.get("cls_pretrained", True)
         
         if backbone_name == "efficientnet_b5":
