@@ -48,26 +48,6 @@ def dice_score(pred_logits, targets, threshold=0.5):
     intersection = (preds_bin * targets).sum()
     return (2.0 * intersection + 1e-6) / (preds_bin.sum() + targets.sum() + 1e-6)
 
-def print_experiment_info(task_name, samples, cfg, train_loader, val_loader):
-    print(f"\n{'='*50}\n {task_name.upper()} EXPERIMENT INFO\n{'='*50}")
-    print(f"Total Samples: {len(samples)} (Train: {len(train_loader.dataset)}, Val: {len(val_loader.dataset)})")
-    
-    n_gpu = torch.cuda.device_count()
-    eff_bs = cfg['batch_size'] * cfg.get('grad_accum_steps', 1)
-    print(f"Hardware: {n_gpu} GPUs detected")
-    print(f"Batch Size: {cfg['batch_size']} | Grad Accum: {cfg.get('grad_accum_steps', 1)} | Effective BS: {eff_bs}")
-    print(f"Epochs: {cfg['epochs']} | LR: {cfg['lr']} | AMP: {cfg.get('use_amp', True)}")
-    
-    organ_counts = {}
-    for s in samples:
-        org = s.get("organ", "Unknown")
-        organ_counts[org] = organ_counts.get(org, 0) + 1
-        
-    print("\n--- Organ Distribution ---")
-    for org, count in sorted(organ_counts.items()):
-        print(f"  {org:15s}: {count} samples")
-    print("="*50 + "\n")
-
 # =======================================================================
 # 1. Image Segmentation
 # =======================================================================
@@ -107,7 +87,7 @@ class ImageSegDatasetV2(Dataset):
             img, mask = res["image"], res["mask"]
             
         mask = mask.unsqueeze(0)  # (1, H, W)
-        return {"input": img, "mask": mask, "organ": s.get("organ", "Unknown")}
+        return {"input": img, "mask": mask}
 
 # Split
 random.shuffle(image_seg_samples)
@@ -119,15 +99,12 @@ train_loader = DataLoader(train_ds, batch_size=CFG["batch_size"], shuffle=True, 
 val_loader = DataLoader(val_ds, batch_size=CFG["batch_size"], shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
 
 model = build_seg_model_v2(CFG).to(DEVICE)
-import torch.nn as nn
 if torch.cuda.device_count() > 1:
-    model = nn.DataParallel(model)
-
+    print(f"Using {torch.cuda.device_count()} GPUs for image_seg!")
+    model = torch.nn.DataParallel(model)
 optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
 scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=CFG["T_0"], T_mult=CFG["T_mult"], eta_min=CFG["eta_min"])
 criterion = SegLossV2(w_dice=CFG["seg_loss_weights"]["dice"], w_focal=CFG["seg_loss_weights"]["focal"], w_bce=CFG["seg_loss_weights"]["bce"]).to(DEVICE)
-
-print_experiment_info("image_seg_v2", image_seg_samples, CFG, train_loader, val_loader)
 
 trainer = UniversalTrainer(CFG, model, optimizer, scheduler, criterion, DEVICE, train_loader, val_loader, dice_score, task_name="image_seg_v2")
 trainer.fit()

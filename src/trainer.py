@@ -43,7 +43,7 @@ class UniversalTrainer:
         self.metric_fn = metric_fn
         self.task_name = task_name
         
-        self.scaler = torch.amp.GradScaler('cuda', enabled=cfg.get("use_amp", True))
+        self.scaler = torch.cuda.amp.GradScaler(enabled=cfg.get("use_amp", True))
         self.ema = EMA(model) if cfg.get("use_ema", False) else None
         
         self.best_metric = 0.0
@@ -104,7 +104,7 @@ class UniversalTrainer:
             targets = batch["mask"].to(self.device) if "mask" in batch else batch["label"].to(self.device)
             bs = inputs.size(0)
             
-            with torch.amp.autocast('cuda', enabled=self.cfg.get("use_amp", True)):
+            with torch.cuda.amp.autocast(enabled=self.cfg.get("use_amp", True)):
                 outputs = self.model(inputs)
                 
                 # Resize if necessary (segmentation)
@@ -146,48 +146,23 @@ class UniversalTrainer:
         val_metric_sum = 0.0
         n_total = 0
         
-        organ_loss_sums = {}
-        organ_metric_sums = {}
-        organ_counts = {}
-        
         with torch.no_grad():
             for batch in self.val_loader:
                 inputs = batch["input"].to(self.device)
                 targets = batch["mask"].to(self.device) if "mask" in batch else batch["label"].to(self.device)
-                organs = batch.get("organ", ["Unknown"] * inputs.size(0))
                 bs = inputs.size(0)
                 
-                # Autocast for validation too for memory efficiency
-                with torch.amp.autocast('cuda', enabled=self.cfg.get("use_amp", True)):
-                    outputs = eval_model(inputs)
-                    if outputs.dim() == 4 and outputs.shape[2:] != targets.shape[2:]:
-                        outputs = F.interpolate(outputs, size=targets.shape[2:], mode="bilinear", align_corners=False)
-                        
-                    loss = self.criterion(outputs, targets)
+                outputs = eval_model(inputs)
+                if outputs.dim() == 4 and outputs.shape[2:] != targets.shape[2:]:
+                    outputs = F.interpolate(outputs, size=targets.shape[2:], mode="bilinear", align_corners=False)
+                    
+                loss = self.criterion(outputs, targets)
                 
                 val_loss_sum += loss.item() * bs
                 val_metric_sum += self.metric_fn(outputs, targets).item() * bs
                 n_total += bs
                 
-                for i in range(bs):
-                    org = organs[i] if isinstance(organs, (list, tuple)) else organs[i].item() if isinstance(organs[i], torch.Tensor) else organs[i]
-                    item_out = outputs[i:i+1]
-                    item_tgt = targets[i:i+1]
-                    item_loss = self.criterion(item_out, item_tgt).item()
-                    item_metric = self.metric_fn(item_out, item_tgt).item()
-                    
-                    organ_loss_sums[org] = organ_loss_sums.get(org, 0.0) + item_loss
-                    organ_metric_sums[org] = organ_metric_sums.get(org, 0.0) + item_metric
-                    organ_counts[org] = organ_counts.get(org, 0) + 1
-                    
-        organ_stats = {}
-        for org, count in organ_counts.items():
-            organ_stats[org] = {
-                "loss": organ_loss_sums[org] / count,
-                "metric": organ_metric_sums[org] / count
-            }
-                
-        return val_loss_sum / max(n_total, 1), val_metric_sum / max(n_total, 1), organ_stats
+        return val_loss_sum / max(n_total, 1), val_metric_sum / max(n_total, 1)
 
     def fit(self):
         print(f"========== STARTING {self.task_name} ==========")
@@ -197,7 +172,7 @@ class UniversalTrainer:
             t0 = time.time()
             
             train_loss, train_metric = self.train_epoch(epoch)
-            val_loss, val_metric, organ_stats = self.validate_epoch()
+            val_loss, val_metric = self.validate_epoch()
             
             t_elapsed = time.time() - t0
             
@@ -208,12 +183,6 @@ class UniversalTrainer:
             print(f"  VRAM: {self.get_vram_usage()} | LR: {get_lr(self.optimizer):.2e}")
             print(f"  Train — loss: {train_loss:.4f} metric: {train_metric:.4f}")
             print(f"  Val   — loss: {val_loss:.4f} metric: {val_metric:.4f}")
-            
-            if organ_stats:
-                print("  --- Per-Organ Validation ---")
-                for org, stats in organ_stats.items():
-                    if org != "Unknown":
-                        print(f"      {org:15s}: loss={stats['loss']:.4f} metric={stats['metric']:.4f}")
             
             self.history.append({
                 "epoch": epoch,

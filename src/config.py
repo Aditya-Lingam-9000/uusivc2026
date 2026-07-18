@@ -25,8 +25,8 @@ CFG = {
     
     # ── Training ─────────────────
     "epochs": 40,
-    "batch_size": 16,        # Increased for 2x T4 GPUs (8 per GPU)
-    "grad_accum_steps": 2,   # Effective batch = 32
+    "batch_size": 8,
+    "grad_accum_steps": 4,  # Effective batch = 32
     
     # ── Optimization ─────────────
     "lr": 2e-4,
