@@ -5,11 +5,7 @@ Trains image_cls and ceus_cls using competition-grade strategies.
 """
 import sys, os, json, random, gc
 import numpy as np
-import cv2
-cv2.setNumThreads(0)
-cv2.ocl.setUseOpenCL(False)
 import torch
-torch.set_num_threads(1)
 import torch.nn as nn
 from PIL import Image
 from pathlib import Path
@@ -67,12 +63,7 @@ class ImageClsDatasetV2(Dataset):
         if img_path.suffix.lower() in [".npy", ".npz"]:
             img = np.load(img_path, allow_pickle=True)
         else:
-            img = cv2.imread(str(img_path))
-            if img is not None:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            else:
-                # Fallback if cv2 fails to read
-                img = np.array(Image.open(img_path).convert("RGB"))
+            img = np.array(Image.open(img_path).convert("RGB"))
 
         if self.augment:
             res = self.augment(image=img)
@@ -90,13 +81,10 @@ val_ds = ImageClsDatasetV2(image_cls_samples[:n_val], augment=get_validation_aug
 # Use a slightly larger batch size for classification
 bs = CFG["batch_size"] * 2
 
-train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=CFG["num_workers"], pin_memory=True, persistent_workers=True, prefetch_factor=2)
-val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True, persistent_workers=True, prefetch_factor=2)
+train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=CFG["num_workers"], pin_memory=True)
+val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
 
 model = ClsModelV2(CFG).to(DEVICE)
-if torch.cuda.device_count() > 1:
-    print(f"Using {torch.cuda.device_count()} GPUs for image_cls!")
-    model = nn.DataParallel(model)
 optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
 scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=CFG["T_0"], T_mult=CFG["T_mult"], eta_min=CFG["eta_min"])
 
@@ -151,14 +139,11 @@ n_val = int(len(ceus_cls_samples) * 0.15)
 train_ds = CEUSClsDatasetV2(ceus_cls_samples[n_val:], augment=get_training_augmentation(CFG["img_size_cls"]))
 val_ds = CEUSClsDatasetV2(ceus_cls_samples[:n_val], augment=get_validation_augmentation(CFG["img_size_cls"]))
 
-# CEUS takes more memory, but we can bump it to 8 across 2 GPUs
-train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, num_workers=CFG["num_workers"], pin_memory=True, persistent_workers=True, prefetch_factor=2)
-val_loader = DataLoader(val_ds, batch_size=8, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True, persistent_workers=True, prefetch_factor=2)
+# CEUS takes more memory, use smaller batch size
+train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=CFG["num_workers"], pin_memory=True)
+val_loader = DataLoader(val_ds, batch_size=4, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
 
 model = CEUSClsModelV2(CFG).to(DEVICE)
-if torch.cuda.device_count() > 1:
-    print(f"Using {torch.cuda.device_count()} GPUs for ceus_cls!")
-    model = nn.DataParallel(model)
 optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
 scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=CFG["T_0"], T_mult=CFG["T_mult"], eta_min=CFG["eta_min"])
 

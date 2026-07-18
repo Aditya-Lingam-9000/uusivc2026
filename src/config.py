@@ -8,7 +8,7 @@ CFG = {
     
     # ── Data & Augmentations ─────
     "img_size_seg": 512,  # Segmentation resolution
-    "img_size_cls": 456,  # Native EfficientNet-B5 resolution (faster CPU processing)
+    "img_size_cls": 512,  # Classification resolution
     "in_channels": 3,
     "aug_prob_heavy": 0.5,
     "aug_prob_light": 0.3,
@@ -25,8 +25,8 @@ CFG = {
     
     # ── Training ─────────────────
     "epochs": 40,
-    "batch_size": 16,
-    "grad_accum_steps": 2,  # Effective batch = 32
+    "batch_size": 8,
+    "grad_accum_steps": 4,  # Effective batch = 32
     
     # ── Optimization ─────────────
     "lr": 2e-4,

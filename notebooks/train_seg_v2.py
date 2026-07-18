@@ -5,11 +5,7 @@ Trains image_seg, ceus_seg, and video_seg using competition-grade strategies.
 """
 import sys, os, json, random, gc
 import numpy as np
-import cv2
-cv2.setNumThreads(0)
-cv2.ocl.setUseOpenCL(False)
 import torch
-torch.set_num_threads(1)
 from PIL import Image
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
@@ -75,23 +71,15 @@ class ImageSegDatasetV2(Dataset):
             if isinstance(img, np.lib.npyio.NpzFile):
                 img = img["arr_0"] # fallback
         else:
-            img = cv2.imread(str(img_path))
-            if img is not None:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            else:
-                img = np.array(Image.open(img_path).convert("RGB"))
+            img = np.array(Image.open(img_path).convert("RGB"))
             
         ann_path = part_root / s["annotation_path_relative"]
         if ann_path.suffix.lower() in [".npy", ".npz"]:
             npz = np.load(ann_path, allow_pickle=True)
             mask = npz["mask"].astype(np.float32) / 255.0  # (H, W)
         else:
-            mask = cv2.imread(str(ann_path), cv2.IMREAD_GRAYSCALE)
-            if mask is not None:
-                mask = mask.astype(np.float32)
-            else:
-                mask = np.array(Image.open(ann_path)).astype(np.float32)
-                if mask.ndim == 3: mask = mask[:,:,0]
+            mask = np.array(Image.open(ann_path)).astype(np.float32)
+            if mask.ndim == 3: mask = mask[:,:,0]
             if mask.max() > 1.0: mask = mask / 255.0
         
         if self.augment:
@@ -107,13 +95,10 @@ n_val = int(len(image_seg_samples) * 0.15)
 train_ds = ImageSegDatasetV2(image_seg_samples[n_val:], augment=get_training_augmentation(CFG["img_size_seg"]))
 val_ds = ImageSegDatasetV2(image_seg_samples[:n_val], augment=get_validation_augmentation(CFG["img_size_seg"]))
 
-train_loader = DataLoader(train_ds, batch_size=CFG["batch_size"], shuffle=True, num_workers=CFG["num_workers"], pin_memory=True, persistent_workers=True, prefetch_factor=2)
-val_loader = DataLoader(val_ds, batch_size=CFG["batch_size"], shuffle=False, num_workers=CFG["num_workers"], pin_memory=True, persistent_workers=True, prefetch_factor=2)
+train_loader = DataLoader(train_ds, batch_size=CFG["batch_size"], shuffle=True, num_workers=CFG["num_workers"], pin_memory=True)
+val_loader = DataLoader(val_ds, batch_size=CFG["batch_size"], shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
 
 model = build_seg_model_v2(CFG).to(DEVICE)
-if torch.cuda.device_count() > 1:
-    print(f"Using {torch.cuda.device_count()} GPUs for image_seg!")
-    model = torch.nn.DataParallel(model)
 optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
 scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=CFG["T_0"], T_mult=CFG["T_mult"], eta_min=CFG["eta_min"])
 criterion = SegLossV2(w_dice=CFG["seg_loss_weights"]["dice"], w_focal=CFG["seg_loss_weights"]["focal"], w_bce=CFG["seg_loss_weights"]["bce"]).to(DEVICE)
