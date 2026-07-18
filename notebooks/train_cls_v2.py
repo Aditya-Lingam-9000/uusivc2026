@@ -81,8 +81,8 @@ val_ds = ImageClsDatasetV2(image_cls_samples[:n_val], augment=get_validation_aug
 # Use a slightly larger batch size for classification
 bs = CFG["batch_size"] * 2
 
-train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=CFG["num_workers"], pin_memory=True)
-val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
+train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=CFG["num_workers"], pin_memory=True, persistent_workers=True, prefetch_factor=2)
+val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True, persistent_workers=True, prefetch_factor=2)
 
 model = ClsModelV2(CFG).to(DEVICE)
 if torch.cuda.device_count() > 1:
@@ -142,9 +142,9 @@ n_val = int(len(ceus_cls_samples) * 0.15)
 train_ds = CEUSClsDatasetV2(ceus_cls_samples[n_val:], augment=get_training_augmentation(CFG["img_size_cls"]))
 val_ds = CEUSClsDatasetV2(ceus_cls_samples[:n_val], augment=get_validation_augmentation(CFG["img_size_cls"]))
 
-# CEUS takes more memory, use smaller batch size
-train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=CFG["num_workers"], pin_memory=True)
-val_loader = DataLoader(val_ds, batch_size=4, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
+# CEUS takes more memory, but we can bump it to 8 across 2 GPUs
+train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, num_workers=CFG["num_workers"], pin_memory=True, persistent_workers=True, prefetch_factor=2)
+val_loader = DataLoader(val_ds, batch_size=8, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True, persistent_workers=True, prefetch_factor=2)
 
 model = CEUSClsModelV2(CFG).to(DEVICE)
 if torch.cuda.device_count() > 1:

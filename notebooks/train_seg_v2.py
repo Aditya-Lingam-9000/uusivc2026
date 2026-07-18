@@ -95,8 +95,8 @@ n_val = int(len(image_seg_samples) * 0.15)
 train_ds = ImageSegDatasetV2(image_seg_samples[n_val:], augment=get_training_augmentation(CFG["img_size_seg"]))
 val_ds = ImageSegDatasetV2(image_seg_samples[:n_val], augment=get_validation_augmentation(CFG["img_size_seg"]))
 
-train_loader = DataLoader(train_ds, batch_size=CFG["batch_size"], shuffle=True, num_workers=CFG["num_workers"], pin_memory=True)
-val_loader = DataLoader(val_ds, batch_size=CFG["batch_size"], shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
+train_loader = DataLoader(train_ds, batch_size=CFG["batch_size"], shuffle=True, num_workers=CFG["num_workers"], pin_memory=True, persistent_workers=True, prefetch_factor=2)
+val_loader = DataLoader(val_ds, batch_size=CFG["batch_size"], shuffle=False, num_workers=CFG["num_workers"], pin_memory=True, persistent_workers=True, prefetch_factor=2)
 
 model = build_seg_model_v2(CFG).to(DEVICE)
 if torch.cuda.device_count() > 1:
