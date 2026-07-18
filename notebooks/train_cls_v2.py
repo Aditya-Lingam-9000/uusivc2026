@@ -7,6 +7,7 @@ import sys, os, json, random, gc
 import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 
@@ -58,7 +59,12 @@ class ImageClsDatasetV2(Dataset):
         s = self.samples[idx]
         part_root = get_partition_root(Path(TRAIN), Path(VAL_DIR) if VAL_DIR else None, s["data_partition_group"])
         
-        img = np.load(part_root / s["input_path_relative"], allow_pickle=True)
+        img_path = part_root / s["input_path_relative"]
+        if img_path.suffix.lower() in [".npy", ".npz"]:
+            img = np.load(img_path, allow_pickle=True)
+        else:
+            img = np.array(Image.open(img_path).convert("RGB"))
+
         if self.augment:
             res = self.augment(image=img)
             img = res["image"]

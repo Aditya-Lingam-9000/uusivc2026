@@ -12,6 +12,7 @@ from pathlib import Path
 import torchvision.transforms as T
 import zipfile
 from tqdm import tqdm
+from PIL import Image
 
 for mod in list(sys.modules.keys()):
     if mod.startswith("src"):
@@ -68,7 +69,10 @@ if os.path.exists(ckpt_path) and task_samples["image_cls"]:
     with torch.no_grad():
         for s in tqdm(task_samples["image_cls"]):
             p = get_partition_root(None, Path(VAL_DIR), s["data_partition_group"]) / s["input_path_relative"]
-            img = np.load(p, allow_pickle=True)
+            if p.suffix.lower() in [".npy", ".npz"]:
+                img = np.load(p, allow_pickle=True)
+            else:
+                img = np.array(Image.open(p).convert("RGB"))
             img_t = torch.tensor(img, dtype=torch.float32).permute(2,0,1)/255.0
             img_t = NORMALIZE(img_t).unsqueeze(0).to(DEVICE)
             
@@ -91,7 +95,11 @@ if os.path.exists(ckpt_path) and task_samples["ceus_cls"]:
     with torch.no_grad():
         for s in tqdm(task_samples["ceus_cls"]):
             p = get_partition_root(None, Path(VAL_DIR), s["data_partition_group"]) / s["input_path_relative"]
-            video = np.load(p, allow_pickle=True)
+            if p.suffix.lower() in [".npy", ".npz"]:
+                video = np.load(p, allow_pickle=True)
+            else:
+                # Fallback, though CEUS is normally a video
+                video = np.array(Image.open(p).convert("RGB"))
             indices = np.linspace(0, video.shape[0]-1, 16, dtype=int)
             frames = video[indices]
             
@@ -120,7 +128,10 @@ if os.path.exists(ckpt_path) and task_samples["image_seg"]:
     with torch.no_grad():
         for s in tqdm(task_samples["image_seg"]):
             p = get_partition_root(None, Path(VAL_DIR), s["data_partition_group"]) / s["input_path_relative"]
-            img = np.load(p, allow_pickle=True)
+            if p.suffix.lower() in [".npy", ".npz"]:
+                img = np.load(p, allow_pickle=True)
+            else:
+                img = np.array(Image.open(p).convert("RGB"))
             orig_h, orig_w = img.shape[:2]
             
             img_t = torch.tensor(img, dtype=torch.float32).permute(2,0,1)/255.0

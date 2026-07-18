@@ -6,6 +6,7 @@ Trains image_seg, ceus_seg, and video_seg using competition-grade strategies.
 import sys, os, json, random, gc
 import numpy as np
 import torch
+from PIL import Image
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 
@@ -64,9 +65,22 @@ class ImageSegDatasetV2(Dataset):
         s = self.samples[idx]
         part_root = get_partition_root(Path(TRAIN), Path(VAL_DIR) if VAL_DIR else None, s["data_partition_group"])
         
-        img = np.load(part_root / s["input_path_relative"], allow_pickle=True)  # (H, W, 3)
-        npz = np.load(part_root / s["annotation_path_relative"], allow_pickle=True)
-        mask = npz["mask"].astype(np.float32) / 255.0  # (H, W)
+        img_path = part_root / s["input_path_relative"]
+        if img_path.suffix.lower() in [".npy", ".npz"]:
+            img = np.load(img_path, allow_pickle=True)
+            if isinstance(img, np.lib.npyio.NpzFile):
+                img = img["arr_0"] # fallback
+        else:
+            img = np.array(Image.open(img_path).convert("RGB"))
+            
+        ann_path = part_root / s["annotation_path_relative"]
+        if ann_path.suffix.lower() in [".npy", ".npz"]:
+            npz = np.load(ann_path, allow_pickle=True)
+            mask = npz["mask"].astype(np.float32) / 255.0  # (H, W)
+        else:
+            mask = np.array(Image.open(ann_path)).astype(np.float32)
+            if mask.ndim == 3: mask = mask[:,:,0]
+            if mask.max() > 1.0: mask = mask / 255.0
         
         if self.augment:
             res = self.augment(image=img, mask=mask)
