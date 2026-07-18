@@ -68,7 +68,7 @@ if os.path.exists(ckpt_path) and task_samples["image_cls"]:
     with torch.no_grad():
         for s in tqdm(task_samples["image_cls"]):
             p = get_partition_root(None, Path(VAL_DIR), s["data_partition_group"]) / s["input_path_relative"]
-            img = np.load(p)
+            img = np.load(p, allow_pickle=True)
             img_t = torch.tensor(img, dtype=torch.float32).permute(2,0,1)/255.0
             img_t = NORMALIZE(img_t).unsqueeze(0).to(DEVICE)
             
@@ -91,7 +91,7 @@ if os.path.exists(ckpt_path) and task_samples["ceus_cls"]:
     with torch.no_grad():
         for s in tqdm(task_samples["ceus_cls"]):
             p = get_partition_root(None, Path(VAL_DIR), s["data_partition_group"]) / s["input_path_relative"]
-            video = np.load(p)
+            video = np.load(p, allow_pickle=True)
             indices = np.linspace(0, video.shape[0]-1, 16, dtype=int)
             frames = video[indices]
             
@@ -120,7 +120,7 @@ if os.path.exists(ckpt_path) and task_samples["image_seg"]:
     with torch.no_grad():
         for s in tqdm(task_samples["image_seg"]):
             p = get_partition_root(None, Path(VAL_DIR), s["data_partition_group"]) / s["input_path_relative"]
-            img = np.load(p)
+            img = np.load(p, allow_pickle=True)
             orig_h, orig_w = img.shape[:2]
             
             img_t = torch.tensor(img, dtype=torch.float32).permute(2,0,1)/255.0

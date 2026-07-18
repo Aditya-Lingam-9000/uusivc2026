@@ -64,8 +64,8 @@ class ImageSegDatasetV2(Dataset):
         s = self.samples[idx]
         part_root = get_partition_root(Path(TRAIN), Path(VAL_DIR) if VAL_DIR else None, s["data_partition_group"])
         
-        img = np.load(part_root / s["input_path_relative"])  # (H, W, 3)
-        npz = np.load(part_root / s["annotation_path_relative"])
+        img = np.load(part_root / s["input_path_relative"], allow_pickle=True)  # (H, W, 3)
+        npz = np.load(part_root / s["annotation_path_relative"], allow_pickle=True)
         mask = npz["mask"].astype(np.float32) / 255.0  # (H, W)
         
         if self.augment:

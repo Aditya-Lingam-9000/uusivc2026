@@ -58,7 +58,7 @@ class ImageClsDatasetV2(Dataset):
         s = self.samples[idx]
         part_root = get_partition_root(Path(TRAIN), Path(VAL_DIR) if VAL_DIR else None, s["data_partition_group"])
         
-        img = np.load(part_root / s["input_path_relative"])
+        img = np.load(part_root / s["input_path_relative"], allow_pickle=True)
         if self.augment:
             res = self.augment(image=img)
             img = res["image"]
@@ -112,7 +112,7 @@ class CEUSClsDatasetV2(Dataset):
     def __getitem__(self, idx):
         s = self.samples[idx]
         part_root = get_partition_root(Path(TRAIN), Path(VAL_DIR) if VAL_DIR else None, s["data_partition_group"])
-        video = np.load(part_root / s["input_path_relative"]) # (64, H, W, 3)
+        video = np.load(part_root / s["input_path_relative"], allow_pickle=True) # (64, H, W, 3)
         
         # Subsample frames (e.g., 16 frames instead of 8 for better temporal resolution)
         indices = np.linspace(0, video.shape[0]-1, 16, dtype=int)
