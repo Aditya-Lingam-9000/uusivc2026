@@ -140,10 +140,13 @@ train_ds = CEUSClsDatasetV2(ceus_cls_samples[n_val:], augment=get_training_augme
 val_ds = CEUSClsDatasetV2(ceus_cls_samples[:n_val], augment=get_validation_augmentation(CFG["img_size_cls"]))
 
 # CEUS takes more memory, use smaller batch size
-train_loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=CFG["num_workers"], pin_memory=True)
-val_loader = DataLoader(val_ds, batch_size=2, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
+train_loader = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=CFG["num_workers"], pin_memory=True)
+val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
 
 model = CEUSClsModelV2(CFG).to(DEVICE)
+if torch.cuda.device_count() > 1:
+    print(f"Using {torch.cuda.device_count()} GPUs with nn.DataParallel for CEUS classification")
+    model = nn.DataParallel(model)
 optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
 scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=CFG["T_0"], T_mult=CFG["T_mult"], eta_min=CFG["eta_min"])
 
