@@ -157,8 +157,8 @@ if ceus_seg_samples:
     train_ds = CEUSSegDatasetV2(ceus_seg_samples[n_val:], augment=get_training_augmentation(CFG["img_size_seg"]))
     val_ds = CEUSSegDatasetV2(ceus_seg_samples[:n_val], augment=get_validation_augmentation(CFG["img_size_seg"]))
 
-    train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=CFG["num_workers"], pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=4, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=11, shuffle=True, num_workers=CFG["num_workers"], pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=11, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
 
     model = build_seg_model_v2(CFG).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
