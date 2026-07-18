@@ -42,6 +42,33 @@ def accuracy_score(pred_logits, targets):
     preds = pred_logits.argmax(dim=1)
     return (preds == targets).float().mean()
 
+def print_experiment_info(task_name, samples, cfg, train_loader, val_loader):
+    print(f"\n{'='*50}\n {task_name.upper()} EXPERIMENT INFO\n{'='*50}")
+    print(f"Total Samples: {len(samples)} (Train: {len(train_loader.dataset)}, Val: {len(val_loader.dataset)})")
+    
+    n_gpu = torch.cuda.device_count()
+    eff_bs = cfg['batch_size'] * cfg.get('grad_accum_steps', 1)
+    print(f"Hardware: {n_gpu} GPUs detected")
+    print(f"Batch Size: {cfg['batch_size']} | Grad Accum: {cfg.get('grad_accum_steps', 1)} | Effective BS: {eff_bs}")
+    print(f"Epochs: {cfg['epochs']} | LR: {cfg['lr']} | AMP: {cfg.get('use_amp', True)}")
+    
+    organ_counts = {}
+    class_counts = {}
+    for s in samples:
+        org = s.get("organ", "Unknown")
+        lbl = s.get("class_label_index", "Unknown")
+        organ_counts[org] = organ_counts.get(org, 0) + 1
+        class_counts[lbl] = class_counts.get(lbl, 0) + 1
+        
+    print("\n--- Organ Distribution ---")
+    for org, count in sorted(organ_counts.items()):
+        print(f"  {org:15s}: {count} samples")
+        
+    print("\n--- Class Distribution ---")
+    for lbl, count in sorted(class_counts.items()):
+        print(f"  Class {lbl}: {count} samples")
+    print("="*50 + "\n")
+
 # =======================================================================
 # 1. Image Classification
 # =======================================================================
@@ -70,7 +97,7 @@ class ImageClsDatasetV2(Dataset):
             img = res["image"]
             
         label = s.get("class_label_index", 0)
-        return {"input": img, "label": torch.tensor(label, dtype=torch.long)}
+        return {"input": img, "label": torch.tensor(label, dtype=torch.long), "organ": s.get("organ", "Unknown")}
 
 # Split
 random.shuffle(image_cls_samples)
@@ -85,6 +112,8 @@ train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=CFG
 val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
 
 model = ClsModelV2(CFG).to(DEVICE)
+if torch.cuda.device_count() > 1:
+    model = nn.DataParallel(model)
 optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
 scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=CFG["T_0"], T_mult=CFG["T_mult"], eta_min=CFG["eta_min"])
 
@@ -95,6 +124,8 @@ alpha = torch.tensor([1.0/max(c, 1) for c in counts]).to(DEVICE)
 alpha = alpha / alpha.sum()
 
 criterion = FocalLoss(alpha=alpha, gamma=CFG["focal_gamma"]).to(DEVICE)
+
+print_experiment_info("image_cls_v2", image_cls_samples, CFG, train_loader, val_loader)
 
 trainer = UniversalTrainer(CFG, model, optimizer, scheduler, criterion, DEVICE, train_loader, val_loader, accuracy_score, task_name="image_cls_v2")
 trainer.fit()
@@ -132,7 +163,7 @@ class CEUSClsDatasetV2(Dataset):
             
         video_t = torch.stack(processed_frames, dim=0) # (16, 3, H, W)
         label = s.get("class_label_index", 0)
-        return {"input": video_t, "label": torch.tensor(label, dtype=torch.long)}
+        return {"input": video_t, "label": torch.tensor(label, dtype=torch.long), "organ": s.get("organ", "Unknown")}
 
 random.shuffle(ceus_cls_samples)
 n_val = int(len(ceus_cls_samples) * 0.15)
@@ -144,6 +175,8 @@ train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=CFG[
 val_loader = DataLoader(val_ds, batch_size=4, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
 
 model = CEUSClsModelV2(CFG).to(DEVICE)
+if torch.cuda.device_count() > 1:
+    model = nn.DataParallel(model)
 optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
 scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=CFG["T_0"], T_mult=CFG["T_mult"], eta_min=CFG["eta_min"])
 
@@ -153,6 +186,8 @@ alpha = torch.tensor([1.0/max(c, 1) for c in counts]).to(DEVICE)
 alpha = alpha / alpha.sum()
 
 criterion = FocalLoss(alpha=alpha, gamma=CFG["focal_gamma"]).to(DEVICE)
+
+print_experiment_info("ceus_cls_v2", ceus_cls_samples, CFG, train_loader, val_loader)
 
 trainer = UniversalTrainer(CFG, model, optimizer, scheduler, criterion, DEVICE, train_loader, val_loader, accuracy_score, task_name="ceus_cls_v2")
 trainer.fit()
