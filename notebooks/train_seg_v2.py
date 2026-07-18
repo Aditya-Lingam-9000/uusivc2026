@@ -65,7 +65,13 @@ class ImageSegDatasetV2(Dataset):
         s = self.samples[idx]
         part_root = get_partition_root(Path(TRAIN), Path(VAL_DIR) if VAL_DIR else None, s["data_partition_group"])
         
-        img_path = part_root / s["input_path_relative"]
+        img_rel = s.get("input_path_relative") or s.get("img_path_relative")
+        ann_rel = s.get("annotation_path_relative") or s.get("mask_path_relative")
+        
+        if img_rel is None:
+            raise KeyError(f"Sample has neither 'input_path_relative' nor 'img_path_relative': {s}")
+            
+        img_path = part_root / img_rel
         if img_path.suffix.lower() in [".npy", ".npz"]:
             img = np.load(img_path, allow_pickle=True)
             if isinstance(img, np.lib.npyio.NpzFile):
@@ -73,14 +79,18 @@ class ImageSegDatasetV2(Dataset):
         else:
             img = np.array(Image.open(img_path).convert("RGB"))
             
-        ann_path = part_root / s["annotation_path_relative"]
-        if ann_path.suffix.lower() in [".npy", ".npz"]:
-            npz = np.load(ann_path, allow_pickle=True)
-            mask = npz["mask"].astype(np.float32) / 255.0  # (H, W)
+        if ann_rel is not None:
+            ann_path = part_root / ann_rel
+            if ann_path.suffix.lower() in [".npy", ".npz"]:
+                npz = np.load(ann_path, allow_pickle=True)
+                mask = npz["mask"].astype(np.float32) / 255.0  # (H, W)
+            else:
+                mask = np.array(Image.open(ann_path)).astype(np.float32)
+                if mask.ndim == 3: mask = mask[:,:,0]
+                if mask.max() > 1.0: mask = mask / 255.0
         else:
-            mask = np.array(Image.open(ann_path)).astype(np.float32)
-            if mask.ndim == 3: mask = mask[:,:,0]
-            if mask.max() > 1.0: mask = mask / 255.0
+            # Zero mask fallback if no annotation is found
+            mask = np.zeros((img.shape[0], img.shape[1]), dtype=np.float32)
         
         if self.augment:
             res = self.augment(image=img, mask=mask)

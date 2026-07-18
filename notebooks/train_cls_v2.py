@@ -59,7 +59,10 @@ def accuracy_score(pred_logits, targets):
 #         s = self.samples[idx]
 #         part_root = get_partition_root(Path(TRAIN), Path(VAL_DIR) if VAL_DIR else None, s["data_partition_group"])
         
-#         img_path = part_root / s["input_path_relative"]
+#         img_rel = s.get("input_path_relative") or s.get("img_path_relative")
+#         if img_rel is None:
+#             raise KeyError(f"Sample has neither 'input_path_relative' nor 'img_path_relative': {s}")
+#         img_path = part_root / img_rel
 #         if img_path.suffix.lower() in [".npy", ".npz"]:
 #             img = np.load(img_path, allow_pickle=True)
 #         else:
