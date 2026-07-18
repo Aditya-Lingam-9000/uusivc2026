@@ -45,13 +45,13 @@ def get_training_augmentation(img_size):
         # ], p=0.3),
         
         # Color/Intensity
-        A.OneOf([
-            A.CLAHE(clip_limit=4.0, p=1.0),
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
-        ], p=0.4),
+        # A.OneOf([
+        #     A.CLAHE(clip_limit=4.0, p=1.0),
+        #     A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
+        # ], p=0.4),
         
         # Noise (Ultrasound specific)
-        create_gauss_noise(p=0.3),
+        # create_gauss_noise(p=0.3),
         
         # Dropout
         create_coarse_dropout(img_size, p=0.3),

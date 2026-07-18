@@ -3,7 +3,7 @@ import os
 CFG = {
     # ── General ──────────────────
     "seed": 42,
-    "num_workers": 4,
+    "num_workers": 2,
     "ckpt_dir": "/kaggle/working/checkpoints",
     
     # ── Data & Augmentations ─────

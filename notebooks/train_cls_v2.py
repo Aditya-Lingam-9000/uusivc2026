@@ -9,6 +9,7 @@ import cv2
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False)
 import torch
+torch.set_num_threads(1)
 import torch.nn as nn
 from PIL import Image
 from pathlib import Path
