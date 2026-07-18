@@ -67,7 +67,12 @@ class ImageClsDatasetV2(Dataset):
         if img_path.suffix.lower() in [".npy", ".npz"]:
             img = np.load(img_path, allow_pickle=True)
         else:
-            img = np.array(Image.open(img_path).convert("RGB"))
+            img = cv2.imread(str(img_path))
+            if img is not None:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            else:
+                # Fallback if cv2 fails to read
+                img = np.array(Image.open(img_path).convert("RGB"))
 
         if self.augment:
             res = self.augment(image=img)

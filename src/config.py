@@ -3,12 +3,12 @@ import os
 CFG = {
     # ── General ──────────────────
     "seed": 42,
-    "num_workers": 2,
+    "num_workers": 4,
     "ckpt_dir": "/kaggle/working/checkpoints",
     
     # ── Data & Augmentations ─────
     "img_size_seg": 512,  # Segmentation resolution
-    "img_size_cls": 512,  # Classification resolution
+    "img_size_cls": 456,  # Native EfficientNet-B5 resolution (faster CPU processing)
     "in_channels": 3,
     "aug_prob_heavy": 0.5,
     "aug_prob_light": 0.3,

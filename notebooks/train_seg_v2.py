@@ -75,15 +75,23 @@ class ImageSegDatasetV2(Dataset):
             if isinstance(img, np.lib.npyio.NpzFile):
                 img = img["arr_0"] # fallback
         else:
-            img = np.array(Image.open(img_path).convert("RGB"))
+            img = cv2.imread(str(img_path))
+            if img is not None:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            else:
+                img = np.array(Image.open(img_path).convert("RGB"))
             
         ann_path = part_root / s["annotation_path_relative"]
         if ann_path.suffix.lower() in [".npy", ".npz"]:
             npz = np.load(ann_path, allow_pickle=True)
             mask = npz["mask"].astype(np.float32) / 255.0  # (H, W)
         else:
-            mask = np.array(Image.open(ann_path)).astype(np.float32)
-            if mask.ndim == 3: mask = mask[:,:,0]
+            mask = cv2.imread(str(ann_path), cv2.IMREAD_GRAYSCALE)
+            if mask is not None:
+                mask = mask.astype(np.float32)
+            else:
+                mask = np.array(Image.open(ann_path)).astype(np.float32)
+                if mask.ndim == 3: mask = mask[:,:,0]
             if mask.max() > 1.0: mask = mask / 255.0
         
         if self.augment:
