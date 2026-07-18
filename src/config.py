@@ -25,7 +25,7 @@ CFG = {
     
     # ── Training ─────────────────
     "epochs": 40,
-    "batch_size": 10,
+    "batch_size": 11,
     "grad_accum_steps": 3,  # Effective batch = 32
     
     # ── Optimization ─────────────
