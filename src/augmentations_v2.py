@@ -39,10 +39,10 @@ def get_training_augmentation(img_size):
         # Spatial/Geometric
         A.HorizontalFlip(p=0.5),
         A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
-        A.OneOf([
-            create_elastic_transform(p=1.0),
-            A.GridDistortion(p=1.0),
-        ], p=0.3),
+        # A.OneOf([
+        #     create_elastic_transform(p=1.0),
+        #     A.GridDistortion(p=1.0),
+        # ], p=0.3),
         
         # Color/Intensity
         A.OneOf([

@@ -5,6 +5,9 @@ Trains image_cls and ceus_cls using competition-grade strategies.
 """
 import sys, os, json, random, gc
 import numpy as np
+import cv2
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
 import torch
 import torch.nn as nn
 from PIL import Image

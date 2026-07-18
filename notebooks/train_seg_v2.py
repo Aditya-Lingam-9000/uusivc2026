@@ -5,6 +5,9 @@ Trains image_seg, ceus_seg, and video_seg using competition-grade strategies.
 """
 import sys, os, json, random, gc
 import numpy as np
+import cv2
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
 import torch
 from PIL import Image
 from pathlib import Path
