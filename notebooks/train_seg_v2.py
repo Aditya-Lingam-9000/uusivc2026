@@ -105,8 +105,8 @@ n_val = int(len(image_seg_samples) * 0.15)
 train_ds = ImageSegDatasetV2(image_seg_samples[n_val:], augment=get_training_augmentation(CFG["img_size_seg"]))
 val_ds = ImageSegDatasetV2(image_seg_samples[:n_val], augment=get_validation_augmentation(CFG["img_size_seg"]))
 
-train_loader = DataLoader(train_ds, batch_size=CFG["batch_size"], shuffle=True, num_workers=CFG["num_workers"], pin_memory=True)
-val_loader = DataLoader(val_ds, batch_size=CFG["batch_size"], shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
+train_loader = DataLoader(train_ds, batch_size=10, shuffle=True, num_workers=CFG["num_workers"], pin_memory=True)
+val_loader = DataLoader(val_ds, batch_size=10, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
 
 model = build_seg_model_v2(CFG).to(DEVICE)
 optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
@@ -119,6 +119,134 @@ trainer.fit()
 del model, optimizer, train_loader, val_loader, train_ds, val_ds, trainer
 gc.collect(); torch.cuda.empty_cache()
 
-# Note: In a full run, we would append the CEUS Seg and Video Seg logic here.
-# For brevity in this V2 framework script, they follow the exact same pattern 
-# (loading custom datasets, then instantiating UniversalTrainer).
+# =======================================================================
+# 2. CEUS Segmentation
+# =======================================================================
+print("\n--- Starting CEUS Segmentation V2 ---")
+ceus_seg_samples = [s for s in all_samples if s["task"] == "ceus_seg"]
+
+class CEUSSegDatasetV2(Dataset):
+    def __init__(self, samples, augment=None):
+        self.samples = samples
+        self.augment = augment
+        
+    def __len__(self): return len(self.samples)
+    
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        part_root = get_partition_root(Path(TRAIN), Path(VAL_DIR) if VAL_DIR else None, s["data_partition_group"])
+        
+        npy_path = part_root / s["input_path_relative"]
+        video = np.load(npy_path, allow_pickle=True)
+        mid_frame = video[len(video)//2].astype(np.uint8) # (H, W, 3)
+        
+        ann_path = part_root / s["annotation_path_relative"]
+        npz = np.load(ann_path, allow_pickle=True)
+        mask = npz["mask"].astype(np.float32) / 255.0 # (H, W)
+        
+        if self.augment:
+            res = self.augment(image=mid_frame, mask=mask)
+            mid_frame, mask = res["image"], res["mask"]
+            
+        mask_t = mask.clone().detach().float().unsqueeze(0) if torch.is_tensor(mask) else torch.tensor(mask).float().unsqueeze(0)
+        return {"input": mid_frame, "mask": mask_t}
+
+if ceus_seg_samples:
+    random.shuffle(ceus_seg_samples)
+    n_val = int(len(ceus_seg_samples) * 0.15)
+    train_ds = CEUSSegDatasetV2(ceus_seg_samples[n_val:], augment=get_training_augmentation(CFG["img_size_seg"]))
+    val_ds = CEUSSegDatasetV2(ceus_seg_samples[:n_val], augment=get_validation_augmentation(CFG["img_size_seg"]))
+
+    train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=CFG["num_workers"], pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=4, shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
+
+    model = build_seg_model_v2(CFG).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=CFG["T_0"], T_mult=CFG["T_mult"], eta_min=CFG["eta_min"])
+    criterion = SegLossV2(w_dice=CFG["seg_loss_weights"]["dice"], w_focal=CFG["seg_loss_weights"]["focal"], w_bce=CFG["seg_loss_weights"]["bce"]).to(DEVICE)
+
+    trainer = UniversalTrainer(CFG, model, optimizer, scheduler, criterion, DEVICE, train_loader, val_loader, dice_score, task_name="ceus_seg_v2")
+    trainer.fit()
+
+    del model, optimizer, train_loader, val_loader, train_ds, val_ds, trainer
+    gc.collect(); torch.cuda.empty_cache()
+
+# =======================================================================
+# 3. Video Segmentation
+# =======================================================================
+print("\n--- Starting Video Segmentation V2 ---")
+video_seg_samples = [s for s in all_samples if s["task"] == "video_seg"]
+
+import time
+class VideoSegFrameDatasetV2(Dataset):
+    def __init__(self, frame_list, augment=None):
+        self.frame_list = frame_list
+        self.augment = augment
+
+    def __len__(self): return len(self.frame_list)
+
+    def __getitem__(self, idx):
+        item = self.frame_list[idx]
+        frame = np.load(item["img_path"], allow_pickle=True)   # uint8 (256, 256)
+        mask = np.load(item["mask_path"], allow_pickle=True)   # float32 (256, 256)
+        
+        frame_3ch = np.stack([frame, frame, frame], axis=-1)  # (256, 256, 3)
+        
+        if self.augment:
+            res = self.augment(image=frame_3ch, mask=mask)
+            frame_3ch, mask = res["image"], res["mask"]
+            
+        mask_t = mask.clone().detach().float().unsqueeze(0) if torch.is_tensor(mask) else torch.tensor(mask).float().unsqueeze(0)
+        return {"input": frame_3ch, "mask": mask_t}
+
+if video_seg_samples:
+    CACHE_DIR = Path("/kaggle/working/video_seg_cache_v2")
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    frame_list = []
+    
+    t_start = time.time()
+    for idx, s in enumerate(video_seg_samples):
+        part_root = get_partition_root(Path(TRAIN), Path(VAL_DIR) if VAL_DIR else None, s["data_partition_group"])
+        ann_path = part_root / s["annotation_path_relative"]
+        
+        try:
+            npz = np.load(ann_path, allow_pickle=True)
+            fnum_mask = npz["fnum_mask"].item()
+            video = None
+            
+            for f_str, mask_arr in fnum_mask.items():
+                frame_idx = int(f_str)
+                sample_id = s["sample_id"]
+                img_save_path = CACHE_DIR / f"{sample_id}_f{frame_idx}_img.npy"
+                mask_save_path = CACHE_DIR / f"{sample_id}_f{frame_idx}_mask.npy"
+                
+                if not img_save_path.exists() or not mask_save_path.exists():
+                    if video is None:
+                        video = np.load(part_root / s["input_path_relative"], allow_pickle=True)
+                    frame = video[0, frame_idx].clip(0, 255).astype(np.uint8)
+                    mask = (mask_arr / 255.0).clip(0, 1).astype(np.float32)
+                    np.save(img_save_path, frame)
+                    np.save(mask_save_path, mask)
+                
+                frame_list.append({"img_path": str(img_save_path), "mask_path": str(mask_save_path)})
+        except Exception as e:
+            pass
+
+    random.shuffle(frame_list)
+    n_val = int(len(frame_list) * 0.15)
+    train_ds = VideoSegFrameDatasetV2(frame_list[n_val:], augment=get_training_augmentation(CFG["img_size_seg"]))
+    val_ds = VideoSegFrameDatasetV2(frame_list[:n_val], augment=get_validation_augmentation(CFG["img_size_seg"]))
+
+    train_loader = DataLoader(train_ds, batch_size=CFG["batch_size"], shuffle=True, num_workers=CFG["num_workers"], pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=CFG["batch_size"], shuffle=False, num_workers=CFG["num_workers"], pin_memory=True)
+
+    model = build_seg_model_v2(CFG).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=CFG["T_0"], T_mult=CFG["T_mult"], eta_min=CFG["eta_min"])
+    criterion = SegLossV2(w_dice=CFG["seg_loss_weights"]["dice"], w_focal=CFG["seg_loss_weights"]["focal"], w_bce=CFG["seg_loss_weights"]["bce"]).to(DEVICE)
+
+    trainer = UniversalTrainer(CFG, model, optimizer, scheduler, criterion, DEVICE, train_loader, val_loader, dice_score, task_name="video_seg_v2")
+    trainer.fit()
+
+    del model, optimizer, train_loader, val_loader, train_ds, val_ds, trainer
+    gc.collect(); torch.cuda.empty_cache()
