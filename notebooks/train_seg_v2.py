@@ -119,6 +119,40 @@ trainer.fit()
 del model, optimizer, train_loader, val_loader, train_ds, val_ds, trainer
 gc.collect(); torch.cuda.empty_cache()
 
+
+import gc
+import torch
+import ctypes
+from numba import cuda
+
+# 1. Clear PyTorch and Python garbage collection
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+# 2. Force-close the CUDA context on ALL detected GPUs
+try:
+    for device in cuda.gpus:
+        with device:
+            cuda.close()
+    print("GPU contexts closed successfully.")
+except Exception as e:
+    print(f"Numba bypass failed: {e}")
+
+# 3. Re-initialize PyTorch's internal memory allocator safely
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+# 4. Force Linux OS to reclaim system RAM
+try:
+    libc = ctypes.CDLL("libc.so.6")
+    libc.malloc_trim(0)
+    print("System RAM trimmed.")
+except Exception:
+    pass
+
+
+
 # =======================================================================
 # 2. CEUS Segmentation
 # =======================================================================
@@ -170,6 +204,41 @@ if ceus_seg_samples:
 
     del model, optimizer, train_loader, val_loader, train_ds, val_ds, trainer
     gc.collect(); torch.cuda.empty_cache()
+
+
+
+import gc
+import torch
+import ctypes
+from numba import cuda
+
+# 1. Clear PyTorch and Python garbage collection
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+# 2. Force-close the CUDA context on ALL detected GPUs
+try:
+    for device in cuda.gpus:
+        with device:
+            cuda.close()
+    print("GPU contexts closed successfully.")
+except Exception as e:
+    print(f"Numba bypass failed: {e}")
+
+# 3. Re-initialize PyTorch's internal memory allocator safely
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+# 4. Force Linux OS to reclaim system RAM
+try:
+    libc = ctypes.CDLL("libc.so.6")
+    libc.malloc_trim(0)
+    print("System RAM trimmed.")
+except Exception:
+    pass
+
+
 
 # =======================================================================
 # 3. Video Segmentation
