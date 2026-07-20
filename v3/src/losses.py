@@ -97,8 +97,10 @@ class UniversalLoss(nn.Module):
         total_loss = 0.0
         
         # 1. Classification Loss
-        if cls_targets is not None and cls_targets.numel() > 0:
-            cls_loss = self.cls_loss_fn(cls_preds, cls_targets)
+        # Only calculate classification loss if there are valid targets (not -1)
+        if cls_targets is not None and cls_targets.numel() > 0 and (cls_targets >= 0).any():
+            valid_mask = cls_targets >= 0
+            cls_loss = self.cls_loss_fn(cls_preds[valid_mask], cls_targets[valid_mask])
             total_loss += self.lambda_cls * cls_loss
             
         # 2. Segmentation Loss (Dice + BCE + Boundary)
