@@ -133,13 +133,15 @@ def train():
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.05)
     
     # 3. Initialize Unified Dataset
-    data_dir = os.environ.get('UUSIVC_DATA_DIR', '/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN')
-    if not os.path.exists(os.path.join(data_dir, 'dataset_json_fingerprints_v4')):
-        print(f"Warning: Data directory {data_dir} not found. Skipping data loading for local test.")
+    train_dir = os.environ.get('UUSIVC_TRAIN_DIR', '/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN')
+    val_dir = os.environ.get('UUSIVC_VAL_DIR', '/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL')
+    
+    if not os.path.exists(os.path.join(train_dir, 'dataset_json_fingerprints_v4')):
+        print(f"Warning: Train data directory {train_dir} not found. Skipping data loading for local test.")
         return
         
-    train_dataset = UniversalDataset(data_dir=data_dir, split='Train')
-    val_dataset = UniversalDataset(data_dir=data_dir, split='Val')
+    train_dataset = UniversalDataset(data_dir=train_dir, split='Train')
+    val_dataset = UniversalDataset(data_dir=val_dir, split='Val')
     
     if len(val_dataset) == 0:
         print("\n" + "!"*50)
