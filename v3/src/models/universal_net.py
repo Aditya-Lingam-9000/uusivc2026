@@ -107,10 +107,10 @@ class TimmEncoder(nn.Module):
         # Determine if offline weights should be loaded
         if weight_path and os.path.exists(weight_path):
             print(f"Loading offline weights for {model_name} from {weight_path}")
-            self.backbone = timm.create_model(model_name, pretrained=False, num_classes=0)
+            self.backbone = timm.create_model(model_name, pretrained=False, num_classes=0, img_size=256)
             self.backbone.load_state_dict(torch.load(weight_path, map_location='cpu'), strict=False)
         else:
-            self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+            self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0, img_size=256)
             
         self.feature_dim = self.backbone.num_features
         
