@@ -3,6 +3,7 @@ import os
 import torch
 import numpy as np
 from PIL import Image
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 # Define mappings from organ names to indices for Prompt embedding
@@ -89,6 +90,10 @@ class UniversalDataset(Dataset):
                 # else assume it's already (T, C, H, W)
                 
             x = torch.from_numpy(video_data).float() / 255.0
+            
+            # Ensure spatial dimensions are strictly 256x256
+            if x.shape[2] != 256 or x.shape[3] != 256:
+                x = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=False)
         else:
             # Image inputs are stored as .jpg or .png
             img = Image.open(input_path).convert('RGB')
@@ -119,6 +124,8 @@ class UniversalDataset(Dataset):
                             if idx < T:
                                 mask_data[idx, 0] = v
                         seg_target = torch.from_numpy(mask_data).float() / 255.0
+                        if seg_target.shape[2] != 256 or seg_target.shape[3] != 256:
+                            seg_target = F.interpolate(seg_target, size=(256, 256), mode='nearest')
                     else:
                         mask_data = npz_data['mask']
                         if len(mask_data.shape) == 3: # (T, H, W)
@@ -128,6 +135,8 @@ class UniversalDataset(Dataset):
                             mask_data = np.expand_dims(mask_data, axis=0)
                             mask_data = np.repeat(mask_data, x.shape[0], axis=0)
                         seg_target = torch.from_numpy(mask_data).float() / 255.0
+                        if seg_target.shape[2] != 256 or seg_target.shape[3] != 256:
+                            seg_target = F.interpolate(seg_target, size=(256, 256), mode='nearest')
                 else:
                     mask = Image.open(target_path).convert('L')
                     mask = mask.resize((256, 256))
