@@ -65,31 +65,48 @@ def evaluate(model, val_loader, device):
                 
             # Compute metrics per sample
             INV_TASK_MAPPING = {0: 'image_cls', 1: 'image_seg', 2: 'ceus_cls', 3: 'ceus_seg', 4: 'video_seg'}
+            INV_ORGAN_MAPPING = {0: 'Appendix', 1: 'Breast', 2: 'Liver', 3: 'Prostate', 4: 'Thyroid', 
+                                 5: 'Breast_luminal', 6: 'Cardiac', 7: 'Fetal_Head', 8: 'Kidney', 
+                                 9: 'BreastCEUS', 10: 'LiverCEUS', 11: 'ProstateCEUS', 12: 'ThyroidCEUS', 13: 'CardiacCH',
+                                 14: 'Unknown'}
+                                 
             for i in range(len(tasks)):
                 t_idx = tasks[i].item()
-                t = INV_TASK_MAPPING.get(t_idx, 'unknown')
+                o_idx = organ_idx[i].item()
                 
-                if t not in task_metrics:
-                    task_metrics[t] = {'correct': 0, 'total_cls': 0, 'dice_sum': 0.0, 'total_frames': 0}
+                t = INV_TASK_MAPPING.get(t_idx, 'unknown')
+                o = INV_ORGAN_MAPPING.get(o_idx, 'unknown')
+                key = f"{t} ({o})"
+                
+                if key not in task_metrics:
+                    task_metrics[key] = {'correct': 0, 'total_cls': 0, 'dice_sum': 0.0, 'total_frames': 0, 'task_type': t}
                     
                 if t in ['image_cls', 'ceus_cls']:
                     c, tot = compute_accuracy(cls_preds[i:i+1], cls_target[i:i+1])
-                    task_metrics[t]['correct'] += c
-                    task_metrics[t]['total_cls'] += tot
+                    task_metrics[key]['correct'] += c
+                    task_metrics[key]['total_cls'] += tot
                 else:
                     d, tot = compute_dice(seg_preds[i:i+1], seg_target[i:i+1])
-                    task_metrics[t]['dice_sum'] += d
-                    task_metrics[t]['total_frames'] += tot
+                    task_metrics[key]['dice_sum'] += d
+                    task_metrics[key]['total_frames'] += tot
                     
-    print("\n--- Validation Results ---")
-    for t, m in task_metrics.items():
+    print("\n" + "-"*60)
+    print(f"{'Task (Organ)':<35} | {'Metric':<10} | Score")
+    print("-" * 60)
+    
+    # Sort keys for pretty printing
+    for key in sorted(task_metrics.keys()):
+        m = task_metrics[key]
+        t = m['task_type']
+        
         if t in ['image_cls', 'ceus_cls']:
             acc = (m['correct'] / m['total_cls']) * 100 if m['total_cls'] > 0 else 0
-            print(f"Task: {t:<15} | Accuracy: {acc:.2f}% ({m['correct']}/{m['total_cls']})")
+            print(f"{key:<35} | {'Accuracy':<10} | {acc:.2f}% ({m['correct']}/{m['total_cls']})")
         else:
             dice = (m['dice_sum'] / m['total_frames']) * 100 if m['total_frames'] > 0 else 0
-            print(f"Task: {t:<15} | Dice Score: {dice:.2f}% ({m['total_frames']} frames evaluated)")
-    print("="*50 + "\n")
+            print(f"{key:<35} | {'Dice':<10} | {dice:.2f}% ({m['total_frames']} frames)")
+            
+    print("="*60 + "\n")
     model.train()
 
 
@@ -111,7 +128,9 @@ def train():
         model = torch.nn.DataParallel(model)
         
     criterion = UniversalLoss(lambda_seg=1.0, lambda_bnd=0.5, lambda_cls=1.0, lambda_temp=0.1).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+    
+    # ADVANCED OPTIMIZATION: AdamW with tuned parameters for Swin Transformer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.05)
     
     # 3. Initialize Unified Dataset
     data_dir = os.environ.get('UUSIVC_DATA_DIR', '/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN')
@@ -139,6 +158,20 @@ def train():
     # 4. Training Loop
     epochs = 10
     total_steps_per_epoch = len(train_loader)
+    
+    # ADVANCED OPTIMIZATION: Gradient Accumulation (Simulate Batch Size 16 = 2 GPUs x 8 steps)
+    grad_steps = 8 
+    
+    # ADVANCED OPTIMIZATION: OneCycleLR Scheduler
+    total_optimization_steps = (total_steps_per_epoch * epochs) // grad_steps
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=1e-3, 
+        total_steps=total_optimization_steps, 
+        pct_start=0.1, 
+        anneal_strategy='cos'
+    )
+    
     model.train()
     
     global_start_time = time.time()
@@ -165,13 +198,22 @@ def train():
             with torch.amp.autocast('cuda'):
                 cls_preds, seg_preds = model(x, organ_idx, modality_idx)
                 loss = criterion(cls_preds, cls_target, seg_preds, seg_target)
+                
+                # Scale loss for gradient accumulation
+                loss = loss / grad_steps
             
             if loss > 0:
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
                 
-                loss_val = loss.item()
+                # Step optimizer only after accumulating gradients
+                if (step + 1) % grad_steps == 0 or (step + 1) == total_steps_per_epoch:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    scheduler.step()
+                
+                # Unscale loss for accurate logging
+                loss_val = loss.item() * grad_steps
                 epoch_loss += loss_val
                 running_loss += loss_val
                 
@@ -190,8 +232,11 @@ def train():
                 vram_used = torch.cuda.memory_allocated(device) / (1024 ** 3)
                 vram_reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
                 
+                current_lr = scheduler.get_last_lr()[0]
+                
                 print(f"  Step [{step+1}/{total_steps_per_epoch}] "
                       f"| Loss: {avg_loss:.4f} "
+                      f"| LR: {current_lr:.6f} "
                       f"| VRAM: {vram_used:.1f}GB (Res: {vram_reserved:.1f}GB) "
                       f"| ETA (Epoch): {eta_epoch/60:.1f}m")
                 
