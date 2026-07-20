@@ -150,8 +150,9 @@ def train():
     
     sampler = get_balanced_sampler(train_dataset)
     
-    # Batch size 2 allows multi-GPU!
-    batch_size = 2 if num_gpus > 1 else 1
+    # Batch size 4 allows multi-GPU to process 2 videos per GPU simultaneously!
+    # With our aggressive VRAM optimizations, this should fit comfortably under 15GB.
+    batch_size = 4 if num_gpus > 1 else 2
     train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=4, collate_fn=pad_collate)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=pad_collate)
     
