@@ -6,6 +6,7 @@ import torch.nn as nn
 import requests
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
+from accelerate import DistributedDataParallelKwargs
 from tqdm import tqdm
 
 # Import our custom V3 modules
@@ -144,9 +145,10 @@ def evaluate(model, val_loader, accelerator):
 
 # --- Training Loop ---
 def train():
-    # 1. Initialize Accelerate DDP
+    # 1. Initialize Accelerate DDP with unused parameter detection for Multi-Head Architecture
     grad_steps = 8 
-    accelerator = Accelerator(mixed_precision="fp16", gradient_accumulation_steps=grad_steps)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(mixed_precision="fp16", gradient_accumulation_steps=grad_steps, kwargs_handlers=[ddp_kwargs])
     
     if accelerator.is_main_process:
         print(f"Distributed Data Parallel Initiated. Detected {accelerator.num_processes} GPUs.")
