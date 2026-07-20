@@ -143,8 +143,16 @@ class UniversalNet(nn.Module):
         # Fold time into batch for shared 2D encoding
         x = x.view(B * T, C, H, W)
             
-        # Extract features
-        features = self.encoder(x)
+        # Extract features (Chunk & Checkpoint to save massive VRAM on long videos)
+        chunk_size_enc = 8
+        features_list = []
+        for i in range(0, B * T, chunk_size_enc):
+            x_chunk = x[i:i+chunk_size_enc]
+            # Use gradient checkpointing to discard intermediate CNN activations
+            f_chunk = checkpoint(self.encoder, x_chunk, use_reentrant=False)
+            features_list.append(f_chunk)
+            
+        features = torch.cat(features_list, dim=0)
         
         # Generate and apply Prompts (FiLM)
         gamma, beta = self.prompter(organ_idx, modality_idx)
