@@ -15,12 +15,18 @@ from tqdm import tqdm
 from PIL import Image
 import pickle
 
-# Fix for numpy pickle loading
-class CompatibilityPickler(pickle.Pickler):
+# Fix for numpy pickle loading on older environments (e.g. Kaggle Python 3.9 + NumPy 1.x)
+class CompatibilityPickler(pickle._Pickler):
     def save_global(self, obj, name=None):
-        if obj.__module__ == 'numpy._core.multiarray':
-            obj.__module__ = 'numpy.core.multiarray'
+        if getattr(obj, '__module__', '').startswith('numpy._core'):
+            obj.__module__ = obj.__module__.replace('numpy._core', 'numpy.core')
         super().save_global(obj, name)
+
+# Monkey-patch pickle.dump so np.savez uses it internally
+_orig_dump = pickle.dump
+def patched_dump(obj, file, protocol=None, **kwargs):
+    CompatibilityPickler(file, protocol, **kwargs).dump(obj)
+pickle.dump = patched_dump
 
 # -----------------------------------------------------------
 # 1. PATHS AND KAGGLE SETUP (Modify these to point to your datasets)
