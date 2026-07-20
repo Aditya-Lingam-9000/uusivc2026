@@ -1,7 +1,10 @@
 import os
+import json
+import time
 import torch
-import requests
+import torch.nn as nn
 from torch.utils.data import DataLoader
+from accelerate import Accelerator
 from tqdm import tqdm
 
 # Import our custom V3 modules
@@ -42,92 +45,120 @@ def download_pretrained_weights(save_dir='./weights'):
     
     return weight_path
 
-# --- Validation Loop ---
-def evaluate(model, val_loader, device):
+# --- Evaluation Loop ---
+def evaluate(model, val_loader, accelerator):
     model.eval()
-    task_metrics = {}
     
-    print("\n" + "="*50)
-    print("Running Detailed Validation...")
+    # Store all gathered predictions and targets across all GPUs
+    all_cls_preds = []
+    all_cls_targets = []
+    all_seg_preds = []
+    all_seg_targets = []
+    all_tasks = []
+    all_organs = []
+    
+    if accelerator.is_main_process:
+        print("\n" + "="*50)
+        print("Running Distributed Detailed Validation...")
     
     with torch.no_grad():
         for batch in val_loader:
-            x = batch['x'].to(device)
-            organ_idx = batch['organ_idx'].to(device)
-            modality_idx = batch['modality_idx'].to(device)
+            x = batch['x']
+            organ_idx = batch['organ_idx']
+            modality_idx = batch['modality_idx']
             
-            cls_target = batch['cls_target'].to(device)
-            seg_target = batch['seg_target'].to(device)
+            cls_target = batch['cls_target']
+            seg_target = batch['seg_target']
             tasks = batch['task']
             
-            with torch.amp.autocast('cuda'):
-                cls_preds, seg_preds = model(x, organ_idx, modality_idx)
+            cls_preds, seg_preds = model(x, organ_idx, modality_idx)
                 
-            # Compute metrics per sample
-            INV_TASK_MAPPING = {0: 'image_cls', 1: 'image_seg', 2: 'ceus_cls', 3: 'ceus_seg', 4: 'video_seg'}
-            INV_ORGAN_MAPPING = {0: 'Appendix', 1: 'Breast', 2: 'Liver', 3: 'Prostate', 4: 'Thyroid', 
-                                 5: 'Breast_luminal', 6: 'Cardiac', 7: 'Fetal_Head', 8: 'Kidney', 
-                                 9: 'BreastCEUS', 10: 'LiverCEUS', 11: 'ProstateCEUS', 12: 'ThyroidCEUS', 13: 'CardiacCH',
-                                 14: 'Unknown'}
-                                 
-            for i in range(len(tasks)):
-                t_idx = tasks[i].item()
-                o_idx = organ_idx[i].item()
-                
-                t = INV_TASK_MAPPING.get(t_idx, 'unknown')
-                o = INV_ORGAN_MAPPING.get(o_idx, 'unknown')
-                key = f"{t} ({o})"
-                
-                if key not in task_metrics:
-                    task_metrics[key] = {'correct': 0, 'total_cls': 0, 'dice_sum': 0.0, 'total_frames': 0, 'task_type': t}
-                    
-                if t in ['image_cls', 'ceus_cls']:
-                    c, tot = compute_accuracy(cls_preds[i:i+1], cls_target[i:i+1])
-                    task_metrics[key]['correct'] += c
-                    task_metrics[key]['total_cls'] += tot
-                else:
-                    d, tot = compute_dice(seg_preds[i:i+1], seg_target[i:i+1])
-                    task_metrics[key]['dice_sum'] += d
-                    task_metrics[key]['total_frames'] += tot
-                    
-    print("\n" + "-"*60)
-    print(f"{'Task (Organ)':<35} | {'Metric':<10} | Score")
-    print("-" * 60)
-    
-    # Sort keys for pretty printing
-    for key in sorted(task_metrics.keys()):
-        m = task_metrics[key]
-        t = m['task_type']
-        
-        if t in ['image_cls', 'ceus_cls']:
-            acc = (m['correct'] / m['total_cls']) * 100 if m['total_cls'] > 0 else 0
-            print(f"{key:<35} | {'Accuracy':<10} | {acc:.2f}% ({m['correct']}/{m['total_cls']})")
-        else:
-            dice = (m['dice_sum'] / m['total_frames']) * 100 if m['total_frames'] > 0 else 0
-            print(f"{key:<35} | {'Dice':<10} | {dice:.2f}% ({m['total_frames']} frames)")
+            # Gather all tensors across all processes
+            gathered_cls_preds, gathered_cls_targets, gathered_seg_preds, gathered_seg_targets, gathered_tasks, gathered_organs = accelerator.gather_for_metrics(
+                (cls_preds, cls_target, seg_preds, seg_target, tasks, organ_idx)
+            )
             
-    print("="*60 + "\n")
+            all_cls_preds.append(gathered_cls_preds)
+            all_cls_targets.append(gathered_cls_targets)
+            all_seg_preds.append(gathered_seg_preds)
+            all_seg_targets.append(gathered_seg_targets)
+            all_tasks.append(gathered_tasks)
+            all_organs.append(gathered_organs)
+            
+    # Compute metrics only on the main process to prevent double printing
+    if accelerator.is_main_process:
+        task_metrics = {}
+        INV_TASK_MAPPING = {0: 'image_cls', 1: 'image_seg', 2: 'ceus_cls', 3: 'ceus_seg', 4: 'video_seg'}
+        INV_ORGAN_MAPPING = {0: 'Appendix', 1: 'Breast', 2: 'Liver', 3: 'Prostate', 4: 'Thyroid', 
+                             5: 'Breast_luminal', 6: 'Cardiac', 7: 'Fetal_Head', 8: 'Kidney', 
+                             9: 'BreastCEUS', 10: 'LiverCEUS', 11: 'ProstateCEUS', 12: 'ThyroidCEUS', 13: 'CardiacCH',
+                             14: 'Unknown'}
+                             
+        all_cls_preds = torch.cat(all_cls_preds, dim=0)
+        all_cls_targets = torch.cat(all_cls_targets, dim=0)
+        all_seg_preds = torch.cat(all_seg_preds, dim=0)
+        all_seg_targets = torch.cat(all_seg_targets, dim=0)
+        all_tasks = torch.cat(all_tasks, dim=0)
+        all_organs = torch.cat(all_organs, dim=0)
+        
+        for i in range(len(all_tasks)):
+            t_idx = all_tasks[i].item()
+            o_idx = all_organs[i].item()
+            
+            t = INV_TASK_MAPPING.get(t_idx, 'unknown')
+            o = INV_ORGAN_MAPPING.get(o_idx, 'unknown')
+            key = f"{t} ({o})"
+            
+            if key not in task_metrics:
+                task_metrics[key] = {'correct': 0, 'total_cls': 0, 'dice_sum': 0.0, 'total_frames': 0, 'task_type': t}
+                
+            if t in ['image_cls', 'ceus_cls']:
+                c, tot = compute_accuracy(all_cls_preds[i:i+1], all_cls_targets[i:i+1])
+                task_metrics[key]['correct'] += c
+                task_metrics[key]['total_cls'] += tot
+            else:
+                d, tot = compute_dice(all_seg_preds[i:i+1], all_seg_targets[i:i+1])
+                task_metrics[key]['dice_sum'] += d
+                task_metrics[key]['total_frames'] += tot
+                
+        print("\n" + "-"*60)
+        print(f"{'Task (Organ)':<35} | {'Metric':<10} | Score")
+        print("-" * 60)
+        
+        for key in sorted(task_metrics.keys()):
+            m = task_metrics[key]
+            t = m['task_type']
+            
+            if t in ['image_cls', 'ceus_cls']:
+                acc = (m['correct'] / m['total_cls']) * 100 if m['total_cls'] > 0 else 0
+                print(f"{key:<35} | {'Accuracy':<10} | {acc:.2f}% ({m['correct']}/{m['total_cls']})")
+            else:
+                dice = (m['dice_sum'] / m['total_frames']) * 100 if m['total_frames'] > 0 else 0
+                print(f"{key:<35} | {'Dice':<10} | {dice:.2f}% ({m['total_frames']} frames)")
+                
+        print("="*60 + "\n")
+        
     model.train()
 
 
 # --- Training Loop ---
 def train():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    num_gpus = torch.cuda.device_count()
-    if num_gpus > 1:
-        print(f"Detected {num_gpus} GPUs! Enabling nn.DataParallel.")
+    # 1. Initialize Accelerate DDP
+    grad_steps = 8 
+    accelerator = Accelerator(mixed_precision="fp16", gradient_accumulation_steps=grad_steps)
     
-    # 1. Download Weights
-    weight_path = download_pretrained_weights()
+    if accelerator.is_main_process:
+        print(f"Distributed Data Parallel Initiated. Detected {accelerator.num_processes} GPUs.")
     
-    # 2. Initialize Model and Loss
-    # We now pass the downloaded local weight_path into the real Swin Transformer engine
-    model = UniversalNet(backbone_name='swin_base_patch4_window7_224', num_classes=2, num_organs=15, weight_path=weight_path).to(device)
-    if num_gpus > 1:
-        model = torch.nn.DataParallel(model)
-        
-    criterion = UniversalLoss(lambda_seg=1.0, lambda_bnd=0.5, lambda_cls=1.0, lambda_temp=0.1).to(device)
+    # 2. Download Weights
+    if accelerator.is_main_process:
+        download_pretrained_weights()
+    accelerator.wait_for_everyone() # Wait for main process to download
+    weight_path = "./weights/swin_base_patch4_window7_224_22k.pth"
+    
+    # 3. Initialize Model and Loss
+    model = UniversalNet(backbone_name='swin_base_patch4_window7_224', num_classes=2, num_organs=15, weight_path=weight_path)
+    criterion = UniversalLoss(lambda_seg=1.0, lambda_bnd=0.5, lambda_cls=1.0, lambda_temp=0.1)
     
     # ADVANCED OPTIMIZATION: AdamW with tuned parameters for Swin Transformer
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.05)
@@ -150,29 +181,27 @@ def train():
     
     sampler = get_balanced_sampler(train_dataset)
     
-    # Batch size 4 allows multi-GPU to process 2 videos per GPU simultaneously!
-    # With our aggressive VRAM optimizations, this should fit comfortably under 15GB.
-    batch_size = 4 if num_gpus > 1 else 2
+    # 4. Prepare with Accelerate
+    # Batch size 2 per GPU = 4 total batch size with 2 GPUs
+    batch_size = 2 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=4, collate_fn=pad_collate)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=pad_collate)
     
-    scaler = torch.amp.GradScaler('cuda')
-    
-    # 4. Training Loop
     epochs = 10
     total_steps_per_epoch = len(train_loader)
-    
-    # ADVANCED OPTIMIZATION: Gradient Accumulation (Simulate Batch Size 16 = 2 GPUs x 8 steps)
-    grad_steps = 8 
-    
-    # ADVANCED OPTIMIZATION: OneCycleLR Scheduler
     total_optimization_steps = (total_steps_per_epoch * epochs) // grad_steps
+    
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, 
         max_lr=1e-3, 
         total_steps=total_optimization_steps, 
         pct_start=0.1, 
         anneal_strategy='cos'
+    )
+    
+    # Bind everything to the DDP Multiprocessing Engine
+    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, scheduler
     )
     
     model.train()
@@ -184,44 +213,35 @@ def train():
         running_loss = 0.0
         epoch_start_time = time.time()
         
-        print(f"\n[EPOCH {epoch+1}/{epochs}] Started...")
+        if accelerator.is_main_process:
+            print(f"\n[EPOCH {epoch+1}/{epochs}] Started...")
         
         for step, batch in enumerate(train_loader):
             step_start = time.time()
             
-            x = batch['x'].to(device)
-            organ_idx = batch['organ_idx'].to(device)
-            modality_idx = batch['modality_idx'].to(device)
+            x = batch['x']
+            organ_idx = batch['organ_idx']
+            modality_idx = batch['modality_idx']
             
-            cls_target = batch['cls_target'].to(device)
-            seg_target = batch['seg_target'].to(device)
+            cls_target = batch['cls_target']
+            seg_target = batch['seg_target']
             
-            optimizer.zero_grad()
-            
-            with torch.amp.autocast('cuda'):
+            # Use Accelerate accumulation context (handles gradient scaling and DDP sync implicitly)
+            with accelerator.accumulate(model):
                 cls_preds, seg_preds = model(x, organ_idx, modality_idx)
                 loss = criterion(cls_preds, cls_target, seg_preds, seg_target)
                 
-                # Scale loss for gradient accumulation
-                loss = loss / grad_steps
-            
-            if loss > 0:
-                scaler.scale(loss).backward()
+                accelerator.backward(loss)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
                 
-                # Step optimizer only after accumulating gradients
-                if (step + 1) % grad_steps == 0 or (step + 1) == total_steps_per_epoch:
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-                    scheduler.step()
-                
-                # Unscale loss for accurate logging
-                loss_val = loss.item() * grad_steps
-                epoch_loss += loss_val
-                running_loss += loss_val
+            loss_val = loss.item()
+            epoch_loss += loss_val
+            running_loss += loss_val
                 
             # Manual Logging every 100 steps
-            if (step + 1) % 100 == 0 or (step + 1) == total_steps_per_epoch:
+            if accelerator.is_main_process and ((step + 1) % 100 == 0 or (step + 1) == total_steps_per_epoch):
                 avg_loss = running_loss / 100 if (step + 1) % 100 == 0 else running_loss / ((step + 1) % 100)
                 running_loss = 0.0
                 
@@ -232,8 +252,8 @@ def train():
                 eta_epoch = time_per_step * (total_steps_per_epoch - steps_completed)
                 
                 # VRAM
-                vram_used = torch.cuda.memory_allocated(device) / (1024 ** 3)
-                vram_reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
+                vram_used = torch.cuda.memory_allocated() / (1024 ** 3)
+                vram_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
                 
                 current_lr = scheduler.get_last_lr()[0]
                 
@@ -244,20 +264,23 @@ def train():
                       f"| ETA (Epoch): {eta_epoch/60:.1f}m")
                 
         # End of Epoch
-        epoch_duration = (time.time() - epoch_start_time) / 60
-        total_eta = epoch_duration * (epochs - epoch - 1)
-        
-        print(f"\n[EPOCH {epoch+1} FINISHED] Average Loss: {epoch_loss / total_steps_per_epoch:.4f}")
-        print(f"Epoch Duration: {epoch_duration:.1f}m | Total Training ETA: {total_eta/60:.1f} hrs")
-        
-        # Save checkpoint
-        torch.save(model.state_dict(), f"./weights/v3_universal_model_ep{epoch+1}.pth")
+        if accelerator.is_main_process:
+            epoch_duration = (time.time() - epoch_start_time) / 60
+            total_eta = epoch_duration * (epochs - epoch - 1)
+            
+            print(f"\n[EPOCH {epoch+1} FINISHED] Average Loss: {epoch_loss / total_steps_per_epoch:.4f}")
+            print(f"Epoch Duration: {epoch_duration:.1f}m | Total Training ETA: {total_eta/60:.1f} hrs")
+            
+            # Save checkpoint
+            unwrapped_model = accelerator.unwrap_model(model)
+            torch.save(unwrapped_model.state_dict(), f"./weights/v3_universal_model_ep{epoch+1}.pth")
         
         # Run Validation
         if len(val_loader) > 0:
-            evaluate(model, val_loader, device)
+            evaluate(model, val_loader, accelerator)
         else:
-            print("\n[SKIPPING VALIDATION] - Validation loader is empty.")
+            if accelerator.is_main_process:
+                print("\n[SKIPPING VALIDATION] - Validation loader is empty.")
 
 if __name__ == "__main__":
     torch.backends.cudnn.deterministic = True
