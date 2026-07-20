@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 class PromptController(nn.Module):
     """
@@ -166,7 +167,17 @@ class UniversalNet(nn.Module):
             
             # Segmentation uses all temporal states
             seg_in = temporal_features.view(B * T, features.size(2), features.size(3), features.size(4))
-            seg_out = self.segmenter(seg_in)
+            
+            # CHUNK & CHECKPOINT TO SAVE MEMORY ON UPSAMPLING
+            chunk_size = 8
+            seg_out_list = []
+            for i in range(0, B * T, chunk_size):
+                seg_chunk_in = seg_in[i:i+chunk_size]
+                # Use gradient checkpointing to discard intermediate upsampling activations
+                seg_chunk_out = checkpoint(self.segmenter, seg_chunk_in, use_reentrant=False)
+                seg_out_list.append(seg_chunk_out)
+            
+            seg_out = torch.cat(seg_out_list, dim=0)
             seg_out = seg_out.view(B, T, 1, seg_out.size(2), seg_out.size(3))
             
         else:
