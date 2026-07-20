@@ -103,10 +103,25 @@ class UniversalDataset(Dataset):
             if item.get('target_path_relative'):
                 target_path = os.path.join(self.data_dir, partition_dir, item['target_path_relative'])
                 if is_video:
-                    mask_data = np.load(target_path)['mask'] # Assuming standardized key
-                    if len(mask_data.shape) == 3: # (T, H, W)
-                        mask_data = np.expand_dims(mask_data, axis=1) # (T, 1, H, W)
-                    seg_target = torch.from_numpy(mask_data).float() / 255.0
+                    npz_data = np.load(target_path, allow_pickle=True)
+                    if 'fnum_mask' in npz_data:
+                        fnum_dict = npz_data['fnum_mask'].item()
+                        T, H, W = x.shape[0], x.shape[2], x.shape[3]
+                        mask_data = np.zeros((T, 1, H, W), dtype=np.float32)
+                        for k, v in fnum_dict.items():
+                            idx = int(k)
+                            if idx < T:
+                                mask_data[idx, 0] = v
+                        seg_target = torch.from_numpy(mask_data).float() / 255.0
+                    else:
+                        mask_data = npz_data['mask']
+                        if len(mask_data.shape) == 3: # (T, H, W)
+                            mask_data = np.expand_dims(mask_data, axis=1) # (T, 1, H, W)
+                        elif len(mask_data.shape) == 2: # (H, W) -> expand to (T, 1, H, W)
+                            mask_data = np.expand_dims(mask_data, axis=0)
+                            mask_data = np.expand_dims(mask_data, axis=0)
+                            mask_data = np.repeat(mask_data, x.shape[0], axis=0)
+                        seg_target = torch.from_numpy(mask_data).float() / 255.0
                 else:
                     mask = Image.open(target_path).convert('L')
                     mask = mask.resize((256, 256))
