@@ -102,13 +102,13 @@ class UniversalNet(nn.Module):
         
         # Simplified backbone mock for local testing
         self.encoder = nn.Sequential(
-            nn.Conv2d(3, 64, 7, stride=2, padding=3),
+            nn.Conv2d(3, 64, 7, stride=2, padding=3),  # 256x256 -> 128x128
             nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.MaxPool2d(3, 2, 1),
-            nn.Conv2d(64, 256, 3, padding=1),
+            nn.MaxPool2d(3, 2, 1),                     # 128x128 -> 64x64
+            nn.Conv2d(64, 256, 3, stride=2, padding=1),# 64x64 -> 32x32
             nn.ReLU(),
-            nn.Conv2d(256, self.feature_dim, 3, padding=1),
+            nn.Conv2d(256, self.feature_dim, 3, stride=2, padding=1), # 32x32 -> 16x16 (Matches ResNet50)
             nn.ReLU()
         )
         
@@ -127,10 +127,10 @@ class UniversalNet(nn.Module):
         self.segmenter = nn.Sequential(
             nn.Conv2d(self.feature_dim, 256, 3, padding=1),
             nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False), # 16x16 -> 64x64
             nn.Conv2d(256, 64, 3, padding=1),
             nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False), # 64x64 -> 256x256
             nn.Conv2d(64, 1, 1) # Single channel output for grayscale masks
         )
 
