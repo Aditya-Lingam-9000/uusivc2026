@@ -77,7 +77,7 @@ class TemporalModule(nn.Module):
 
 
 class UniversalNet(nn.Module):
-    def __init__(self, backbone_name='resnet50', num_classes=2, num_organs=10, num_modalities=3):
+    def __init__(self, backbone_name='resnet50', num_classes=2, num_organs=15, num_modalities=3):
         super().__init__()
         # 1. Shared Encoder (Using a standard CNN or Swin via timm. Here we mock a generic CNN structure)
         # Note: In production on Kaggle, we will replace this with `timm.create_model(backbone_name, pretrained=True)`

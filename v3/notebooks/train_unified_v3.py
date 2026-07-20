@@ -51,7 +51,8 @@ def train():
     # 2. Initialize Model and Loss
     # Note: On Kaggle, backbone_name would be 'swin_base_patch4_window7_224'
     # We will load the downloaded state_dict here in the real pipeline.
-    model = UniversalNet(backbone_name='resnet50', num_classes=2).to(device)
+    # Set num_organs=15 to support up to 14 classes (CardiacCH=13)
+    model = UniversalNet(backbone_name='resnet50', num_classes=2, num_organs=15).to(device)
     criterion = UniversalLoss(lambda_seg=1.0, lambda_bnd=0.5, lambda_cls=1.0, lambda_temp=0.1).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
     
