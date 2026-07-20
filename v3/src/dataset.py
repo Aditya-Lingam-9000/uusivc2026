@@ -58,8 +58,16 @@ class UniversalDataset(Dataset):
         modality_idx = MODALITY_MAPPING.get(task, 0)
         is_video = (modality_idx > 0)
         
+        # Map JSON partition names to actual physical directory names
+        DIR_MAPPING = {
+            'private_train': 'Challenge_Data_Private_v2_fully_anonymized/Train',
+            'public_all': 'Challenge_Data_Public',
+            'private_val': 'Challenge_Data_Private_v2_fully_anonymized/Val'
+        }
+        partition_dir = DIR_MAPPING.get(item['data_partition_group'], item['data_partition_group'])
+        
         # Load Input (Image or Video)
-        input_path = os.path.join(self.data_dir, item['data_partition_group'], item['input_path_relative'])
+        input_path = os.path.join(self.data_dir, partition_dir, item['input_path_relative'])
         
         if is_video:
             # Video inputs are stored as .npy or .npz
@@ -93,7 +101,7 @@ class UniversalDataset(Dataset):
                 
         elif task in ['image_seg', 'ceus_seg', 'video_seg']:
             if item.get('target_path_relative'):
-                target_path = os.path.join(self.data_dir, item['data_partition_group'], item['target_path_relative'])
+                target_path = os.path.join(self.data_dir, partition_dir, item['target_path_relative'])
                 if is_video:
                     mask_data = np.load(target_path)['mask'] # Assuming standardized key
                     if len(mask_data.shape) == 3: # (T, H, W)
