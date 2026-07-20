@@ -21,6 +21,12 @@ MODALITY_MAPPING = {
     'video_seg': 2
 }
 
+TASK_MAPPING = {
+    'image_cls': 0, 'image_seg': 1,
+    'ceus_cls': 2, 'ceus_seg': 3,
+    'video_seg': 4
+}
+
 class UniversalDataset(Dataset):
     def __init__(self, data_dir, split='Train', transform=None):
         self.data_dir = data_dir
@@ -148,7 +154,7 @@ class UniversalDataset(Dataset):
             'organ_idx': organ_idx,
             'modality_idx': modality_idx,
             'is_video': is_video,
-            'task': task,
+            'task': TASK_MAPPING.get(task, 0),
             'cls_target': cls_target.squeeze(),
             'seg_target': seg_target
         }
@@ -229,7 +235,7 @@ def pad_collate(batch):
         'organ_idx': torch.tensor([item['organ_idx'] for item in batch], dtype=torch.long),
         'modality_idx': torch.tensor([item['modality_idx'] for item in batch], dtype=torch.long),
         'is_video': torch.tensor([item['is_video'] for item in batch], dtype=torch.bool),
-        'task': [item['task'] for item in batch],
+        'task': torch.tensor([item['task'] for item in batch], dtype=torch.long),
         'cls_target': torch.stack([item['cls_target'] for item in batch], dim=0),
         'seg_target': torch.stack(seg_targets, dim=0) if has_seg else torch.empty(0)
     }

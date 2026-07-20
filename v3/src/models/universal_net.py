@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from torch.utils.checkpoint import checkpoint
 
 class PromptController(nn.Module):
@@ -93,24 +94,47 @@ class TemporalModule(nn.Module):
         return temporal_stack_expanded, final_hidden
 
 
-class UniversalNet(nn.Module):
-    def __init__(self, backbone_name='resnet50', num_classes=2, num_organs=15, num_modalities=3):
+class TimmEncoder(nn.Module):
+    """
+    Production-ready backbone wrapper for Kaggle using timm.
+    Supports Swin Transformers and standard CNNs like ResNet.
+    """
+    def __init__(self, model_name='swin_base_patch4_window7_224', pretrained=True, weight_path=None):
         super().__init__()
-        # 1. Shared Encoder (Using a standard CNN or Swin via timm. Here we mock a generic CNN structure)
-        # Note: In production on Kaggle, we will replace this with `timm.create_model(backbone_name, pretrained=True)`
-        self.feature_dim = 1024 # Assumed output channels of the backbone bottleneck
+        import timm
         
-        # Simplified backbone mock for local testing
-        self.encoder = nn.Sequential(
-            nn.Conv2d(3, 64, 7, stride=2, padding=3),  # 256x256 -> 128x128
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(3, 2, 1),                     # 128x128 -> 64x64
-            nn.Conv2d(64, 256, 3, stride=2, padding=1),# 64x64 -> 32x32
-            nn.ReLU(),
-            nn.Conv2d(256, self.feature_dim, 3, stride=2, padding=1), # 32x32 -> 16x16 (Matches ResNet50)
-            nn.ReLU()
-        )
+        # Determine if offline weights should be loaded
+        if weight_path and os.path.exists(weight_path):
+            print(f"Loading offline weights for {model_name} from {weight_path}")
+            self.backbone = timm.create_model(model_name, pretrained=False, num_classes=0)
+            self.backbone.load_state_dict(torch.load(weight_path, map_location='cpu'), strict=False)
+        else:
+            self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+            
+        self.feature_dim = self.backbone.num_features
+        
+    def forward(self, x):
+        # x is (B, 3, 256, 256)
+        features = self.backbone.forward_features(x)
+        
+        # Handle Swin Transformer output dimensions (B, L, C) or (B, H, W, C)
+        if features.dim() == 3:
+            B, L, C = features.shape
+            H = W = int(math.sqrt(L))
+            features = features.transpose(1, 2).view(B, C, H, W)
+        elif features.dim() == 4 and features.shape[1] != self.feature_dim:
+            # Permute (B, H, W, C) to (B, C, H, W)
+            features = features.permute(0, 3, 1, 2)
+            
+        return features
+
+class UniversalNet(nn.Module):
+    def __init__(self, backbone_name='swin_base_patch4_window7_224', num_classes=2, num_organs=15, num_modalities=3, weight_path=None):
+        super().__init__()
+        
+        # 1. Shared Encoder (Timm Backbone)
+        self.encoder = TimmEncoder(model_name=backbone_name, pretrained=True, weight_path=weight_path)
+        self.feature_dim = self.encoder.feature_dim
         
         # 2. Prompting Module
         self.prompter = PromptController(num_organs, num_modalities, feature_dim=self.feature_dim)
@@ -127,10 +151,10 @@ class UniversalNet(nn.Module):
         self.segmenter = nn.Sequential(
             nn.Conv2d(self.feature_dim, 256, 3, padding=1),
             nn.ReLU(),
-            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False), # 16x16 -> 64x64
+            nn.Upsample(size=(64, 64), mode='bilinear', align_corners=False), # Absolute upsample
             nn.Conv2d(256, 64, 3, padding=1),
             nn.ReLU(),
-            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False), # 64x64 -> 256x256
+            nn.Upsample(size=(256, 256), mode='bilinear', align_corners=False), # Absolute upsample to 256x256
             nn.Conv2d(64, 1, 1) # Single channel output for grayscale masks
         )
 

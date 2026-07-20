@@ -64,8 +64,11 @@ def evaluate(model, val_loader, device):
                 cls_preds, seg_preds = model(x, organ_idx, modality_idx)
                 
             # Compute metrics per sample
+            INV_TASK_MAPPING = {0: 'image_cls', 1: 'image_seg', 2: 'ceus_cls', 3: 'ceus_seg', 4: 'video_seg'}
             for i in range(len(tasks)):
-                t = tasks[i]
+                t_idx = tasks[i].item()
+                t = INV_TASK_MAPPING.get(t_idx, 'unknown')
+                
                 if t not in task_metrics:
                     task_metrics[t] = {'correct': 0, 'total_cls': 0, 'dice_sum': 0.0, 'total_frames': 0}
                     
@@ -102,7 +105,8 @@ def train():
     weight_path = download_pretrained_weights()
     
     # 2. Initialize Model and Loss
-    model = UniversalNet(backbone_name='resnet50', num_classes=2, num_organs=15).to(device)
+    # We now pass the downloaded local weight_path into the real Swin Transformer engine
+    model = UniversalNet(backbone_name='swin_base_patch4_window7_224', num_classes=2, num_organs=15, weight_path=weight_path).to(device)
     if num_gpus > 1:
         model = torch.nn.DataParallel(model)
         
@@ -117,6 +121,11 @@ def train():
         
     train_dataset = UniversalDataset(data_dir=data_dir, split='Train')
     val_dataset = UniversalDataset(data_dir=data_dir, split='Val')
+    
+    if len(val_dataset) == 0:
+        print("\n" + "!"*50)
+        print("WARNING: Validation dataset is EMPTY. Ensure 'private_val_for_participants.json' exists in your Kaggle input!")
+        print("!"*50 + "\n")
     
     sampler = get_balanced_sampler(train_dataset)
     
@@ -197,7 +206,10 @@ def train():
         torch.save(model.state_dict(), f"./weights/v3_universal_model_ep{epoch+1}.pth")
         
         # Run Validation
-        evaluate(model, val_loader, device)
+        if len(val_loader) > 0:
+            evaluate(model, val_loader, device)
+        else:
+            print("\n[SKIPPING VALIDATION] - Validation loader is empty.")
 
 if __name__ == "__main__":
     torch.backends.cudnn.deterministic = True
