@@ -124,9 +124,11 @@ if os.path.exists(CEUS_CLS_CKPT) and task_samples["ceus_cls"]:
                 video = np.array(Image.open(p).convert("RGB"))
             
             indices = np.linspace(0, video.shape[0]-1, 16, dtype=int)
-            frames = video[indices]
+            frames = video[indices] # (16, H, W, 3)
             
+            # Resize and normalize frames
             frames_t = torch.tensor(frames, dtype=torch.float32).permute(0,3,1,2)/255.0
+            frames_t = F.interpolate(frames_t, size=(CFG["img_size_cls"], CFG["img_size_cls"]), mode="bilinear", align_corners=False)
             for i in range(16): frames_t[i] = NORMALIZE(frames_t[i])
             video_t = frames_t.unsqueeze(0).to(DEVICE)
             
@@ -166,7 +168,13 @@ if os.path.exists(IMAGE_SEG_CKPT) and task_samples["image_seg"]:
             mask = morphological_cleanup(probs)
             
             ann_rel = s.get("annotation_path_relative")
-            save_path = SUBMIT_DIR / (ann_rel if ann_rel else f"image_seg/{s['sample_id']}.png")
+            if ann_rel:
+                save_path = SUBMIT_DIR / ann_rel
+            else:
+                target_name = s.get("target_name") or f"seg_mask_{s['sample_id']}.png"
+                dataset_nm  = s.get("dataset_name", s.get("organ", "Unknown"))
+                save_path = SUBMIT_DIR / "image_seg" / dataset_nm / "masks" / target_name
+                
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             Image.fromarray((mask * 255).astype(np.uint8)).save(save_path)
 

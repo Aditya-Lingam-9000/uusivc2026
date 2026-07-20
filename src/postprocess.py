@@ -8,18 +8,8 @@ def apply_tta_seg(model, image_tensor):
     """Applies basic TTA (Horizontal and Vertical Flips) and averages predictions."""
     # image_tensor: (B, 3, H, W)
     
-    # Original
-    pred_orig = model(image_tensor)
-    
-    # H-Flip
-    img_hflip = torch.flip(image_tensor, dims=[3])
-    pred_hflip = torch.flip(model(img_hflip), dims=[3])
-    
-    # V-Flip
-    img_vflip = torch.flip(image_tensor, dims=[2])
-    pred_vflip = torch.flip(model(img_vflip), dims=[2])
-    
-    return (pred_orig + pred_hflip + pred_vflip) / 3.0
+    # Disabled TTA: Vertical and Horizontal flipping destroys asymmetric ultrasound features (like in Cardiac/Liver)
+    return model(image_tensor)
 
 def morphological_cleanup(mask_np):
     """Applies opening and closing to remove spurious regions, and keeps largest connected component."""
