@@ -74,6 +74,9 @@ def train():
     # To use larger batch sizes, we'd need a custom collate_fn that pads/groups by modality.
     train_loader = DataLoader(train_dataset, batch_size=1, sampler=sampler, num_workers=4)
     
+    # Initialize Mixed Precision Scaler to save 50% VRAM and prevent OOM
+    scaler = torch.cuda.amp.GradScaler()
+    
     # 4. Training Loop
     epochs = 10
     model.train()
@@ -93,15 +96,15 @@ def train():
             
             optimizer.zero_grad()
             
-            # Forward Pass (handles prompt gating dynamically)
-            cls_preds, seg_preds = model(x, organ_idx, modality_idx, is_video=is_video)
-            
-            # Loss Calculation (handles missing targets automatically)
-            loss = criterion(cls_preds, cls_target, seg_preds, seg_target, is_video=is_video)
+            # Forward Pass with Automatic Mixed Precision (AMP)
+            with torch.cuda.amp.autocast():
+                cls_preds, seg_preds = model(x, organ_idx, modality_idx, is_video=is_video)
+                loss = criterion(cls_preds, cls_target, seg_preds, seg_target, is_video=is_video)
             
             if loss > 0:
-                loss.backward()
-                optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 epoch_loss += loss.item()
                 
             pbar.set_postfix({'loss': loss.item() if isinstance(loss, torch.Tensor) else 0.0})
