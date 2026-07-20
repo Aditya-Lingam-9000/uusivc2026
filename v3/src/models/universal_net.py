@@ -57,23 +57,39 @@ class ConvGRUCell(nn.Module):
 
 
 class TemporalModule(nn.Module):
-    """Processes video features across the time dimension."""
-    def __init__(self, feature_dim):
+    """Processes video features across the time dimension with bottleneck to save VRAM."""
+    def __init__(self, feature_dim, hidden_dim=256):
         super().__init__()
-        self.rnn = ConvGRUCell(feature_dim, feature_dim)
+        self.compress = nn.Conv2d(feature_dim, hidden_dim, 1) # 1x1 conv bottleneck
+        self.rnn = ConvGRUCell(hidden_dim, hidden_dim)
+        self.expand = nn.Conv2d(hidden_dim, feature_dim, 1) # Expand back
         
     def forward(self, x):
         # x shape: (Batch, Time, Channels, Height, Width)
         B, T, C, H, W = x.shape
-        hidden = torch.zeros(B, C, H, W, device=x.device)
+        
+        # Compress channels first to save massive VRAM
+        x = x.view(B * T, C, H, W)
+        x_compressed = self.compress(x)
+        x_compressed = x_compressed.view(B, T, -1, H, W)
+        
+        hidden = torch.zeros(B, x_compressed.size(2), H, W, device=x.device)
         
         temporal_features = []
         for t in range(T):
-            hidden = self.rnn(x[:, t], hidden)
+            hidden = self.rnn(x_compressed[:, t], hidden)
             temporal_features.append(hidden)
             
-        # Return all temporal states for segmentation, or the final state for classification
-        return torch.stack(temporal_features, dim=1), hidden
+        temporal_stack = torch.stack(temporal_features, dim=1) # (B, T, hidden, H, W)
+        
+        # Expand back to original feature_dim for the unified heads
+        temporal_stack = temporal_stack.view(B * T, -1, H, W)
+        temporal_stack_expanded = self.expand(temporal_stack)
+        temporal_stack_expanded = temporal_stack_expanded.view(B, T, C, H, W)
+        
+        final_hidden = temporal_stack_expanded[:, -1] # Last frame for classification
+        
+        return temporal_stack_expanded, final_hidden
 
 
 class UniversalNet(nn.Module):

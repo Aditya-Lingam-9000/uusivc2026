@@ -75,7 +75,7 @@ def train():
     train_loader = DataLoader(train_dataset, batch_size=1, sampler=sampler, num_workers=4)
     
     # Initialize Mixed Precision Scaler to save 50% VRAM and prevent OOM
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
     
     # 4. Training Loop
     epochs = 10
@@ -97,7 +97,7 @@ def train():
             optimizer.zero_grad()
             
             # Forward Pass with Automatic Mixed Precision (AMP)
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 cls_preds, seg_preds = model(x, organ_idx, modality_idx, is_video=is_video)
                 loss = criterion(cls_preds, cls_target, seg_preds, seg_target, is_video=is_video)
             
