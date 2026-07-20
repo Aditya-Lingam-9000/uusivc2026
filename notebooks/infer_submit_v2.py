@@ -159,7 +159,8 @@ if os.path.exists(IMAGE_SEG_CKPT) and task_samples["image_seg"]:
             probs = torch.sigmoid(logits)[0,0].cpu().numpy()
             mask = morphological_cleanup(probs)
             
-            save_path = SUBMIT_DIR / s.get("annotation_path_relative", f"image_seg/{s['sample_id']}.png")
+            ann_rel = s.get("annotation_path_relative")
+            save_path = SUBMIT_DIR / (ann_rel if ann_rel else f"image_seg/{s['sample_id']}.png")
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             Image.fromarray((mask * 255).astype(np.uint8)).save(save_path)
 
@@ -192,8 +193,9 @@ if os.path.exists(CEUS_SEG_CKPT) and task_samples["ceus_seg"]:
             mask_bin = (mask * 255).astype(np.uint8)
             
             # Save Path
-            if s.get("annotation_path_relative"):
-                save_path = SUBMIT_DIR / s["annotation_path_relative"]
+            ann_rel = s.get("annotation_path_relative")
+            if ann_rel:
+                save_path = SUBMIT_DIR / ann_rel
             else:
                 target_name = s.get("target_name") or f"seg_annotation_{n_ceus_seg_done:05d}.npz"
                 dataset_nm  = s.get("dataset_name", s["organ"])
@@ -240,8 +242,9 @@ if os.path.exists(VIDEO_SEG_CKPT) and task_samples["video_seg"]:
                 fnum_mask[str(fi)] = (mask * 255).astype(np.uint8)
                 
             # Save Path
-            if s.get("annotation_path_relative"):
-                save_path = SUBMIT_DIR / s["annotation_path_relative"]
+            ann_rel = s.get("annotation_path_relative")
+            if ann_rel:
+                save_path = SUBMIT_DIR / ann_rel
             else:
                 target_name = s.get("target_name") or f"seg_annotation_{n_video_seg_done:05d}.npz"
                 dataset_nm  = s.get("dataset_name", "CardiacCH")
