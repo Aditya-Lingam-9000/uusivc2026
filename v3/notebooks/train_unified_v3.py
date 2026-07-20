@@ -3,6 +3,7 @@ import json
 import time
 import torch
 import torch.nn as nn
+import requests
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
 from tqdm import tqdm
