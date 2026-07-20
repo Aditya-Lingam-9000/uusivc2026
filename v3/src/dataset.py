@@ -79,9 +79,14 @@ class UniversalDataset(Dataset):
                 raise ValueError(f"Unknown video format: {input_path}")
             
             # Convert to tensor: (Time, Channels, H, W)
-            # Typically ultrasound videos are (Time, H, W, C)
-            if video_data.shape[-1] == 3 or video_data.shape[-1] == 1:
-                video_data = np.transpose(video_data, (0, 3, 1, 2))
+            if len(video_data.shape) == 4:
+                if video_data.shape[-1] in [1, 3]:
+                    # (T, H, W, C) -> (T, C, H, W)
+                    video_data = np.transpose(video_data, (0, 3, 1, 2))
+                elif video_data.shape[0] in [1, 3]:
+                    # (C, T, H, W) -> (T, C, H, W)
+                    video_data = np.transpose(video_data, (1, 0, 2, 3))
+                # else assume it's already (T, C, H, W)
                 
             x = torch.from_numpy(video_data).float() / 255.0
         else:
