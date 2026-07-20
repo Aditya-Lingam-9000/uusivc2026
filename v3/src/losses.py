@@ -87,12 +87,12 @@ class UniversalLoss(nn.Module):
         self.bnd_loss_fn = BoundaryLoss()
         self.temp_loss_fn = TemporalConsistencyLoss()
 
-    def forward(self, cls_preds, cls_targets, seg_preds, seg_targets, is_video=False):
+    def forward(self, cls_preds, cls_targets, seg_preds, seg_targets):
         """
         Calculates a joint loss for universal multi-task learning.
         cls_preds: (B, NumClasses), cls_targets: (B)
-        seg_preds: (B, 1, H, W) or (B, T, 1, H, W) for videos
-        seg_targets: (B, 1, H, W) or (B, T, 1, H, W)
+        seg_preds: (B, T, 1, H, W) for all tasks
+        seg_targets: (B, T, 1, H, W) for all tasks (dummy tasks padded with -1.0)
         """
         total_loss = 0.0
         
@@ -105,32 +105,44 @@ class UniversalLoss(nn.Module):
             
         # 2. Segmentation Loss (Dice + BCE + Boundary)
         if seg_targets is not None and seg_targets.numel() > 0:
-            if is_video:
-                B, T, C, H, W = seg_preds.shape
-                # Flatten time into batch for standard 2D losses
-                s_preds = seg_preds.view(B * T, C, H, W)
-                s_targs = seg_targets.view(B * T, C, H, W)
-            else:
-                s_preds = seg_preds
-                s_targs = seg_targets
-
-            bce_loss = F.binary_cross_entropy_with_logits(s_preds, s_targs)
+            B, T, C, H, W = seg_preds.shape
             
-            # Simple Dice Loss
-            pred_sig = torch.sigmoid(s_preds)
-            intersection = (pred_sig * s_targs).sum(dim=(2, 3))
-            union = pred_sig.sum(dim=(2, 3)) + s_targs.sum(dim=(2, 3))
-            dice_loss = 1 - (2. * intersection / (union + 1e-5)).mean()
+            # Flatten time into batch for standard 2D losses
+            s_preds = seg_preds.view(B * T, C, H, W)
+            s_targs = seg_targets.view(B * T, C, H, W)
             
-            seg_loss = bce_loss + dice_loss
-            total_loss += self.lambda_seg * seg_loss
+            # Mask out dummy padded frames (-1.0)
+            valid_mask = (s_targs != -1.0).float()
             
-            # Boundary Loss (for NSD)
-            bnd_loss = self.bnd_loss_fn(s_preds, s_targs)
-            total_loss += self.lambda_bnd * bnd_loss
+            # If there's at least one valid pixel to segment
+            if valid_mask.sum() > 0:
+                # Compute BCE loss (unreduced)
+                bce_loss = F.binary_cross_entropy_with_logits(s_preds, s_targs.clamp(min=0.0), reduction='none')
+                bce_loss = (bce_loss * valid_mask).sum() / (valid_mask.sum() + 1e-8)
+                
+                # Compute Dice Loss
+                pred_sig = torch.sigmoid(s_preds) * valid_mask
+                targs_clean = s_targs.clamp(min=0.0) * valid_mask
+                
+                intersection = (pred_sig * targs_clean).sum(dim=(2, 3))
+                union = pred_sig.sum(dim=(2, 3)) + targs_clean.sum(dim=(2, 3))
+                
+                # Only average over batches/frames that actually had a target
+                frame_has_target = valid_mask.sum(dim=(1, 2, 3)) > 0
+                if frame_has_target.any():
+                    dice_loss = 1 - (2. * intersection[frame_has_target] / (union[frame_has_target] + 1e-5)).mean()
+                    
+                    # Boundary Loss (for NSD)
+                    bnd_loss = self.bnd_loss_fn(s_preds[frame_has_target], targs_clean[frame_has_target])
+                    total_loss += self.lambda_bnd * bnd_loss
+                else:
+                    dice_loss = 0.0
+                    
+                seg_loss = bce_loss + dice_loss
+                total_loss += self.lambda_seg * seg_loss
             
             # 3. Temporal Consistency Loss (Videos Only)
-            if is_video:
+            if T > 1:
                 temp_loss = self.temp_loss_fn(seg_preds)
                 total_loss += self.lambda_temp * temp_loss
                 

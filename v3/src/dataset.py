@@ -95,6 +95,7 @@ class UniversalDataset(Dataset):
             # Basic resize for unified backbone
             img = img.resize((256, 256)) 
             x = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
+            x = x.unsqueeze(0) # (1, C, H, W) to treat as a 1-frame video
 
         # Load Targets
         cls_target = torch.tensor([-1], dtype=torch.long)
@@ -131,6 +132,7 @@ class UniversalDataset(Dataset):
                     mask = Image.open(target_path).convert('L')
                     mask = mask.resize((256, 256))
                     seg_target = torch.from_numpy(np.array(mask)).unsqueeze(0).float() / 255.0
+                    seg_target = seg_target.unsqueeze(0) # (1, 1, H, W)
 
         return {
             'x': x,
@@ -178,3 +180,48 @@ def get_balanced_sampler(dataset):
             weights[idx] = (weight_per_class[0] + weight_per_class[1]) / 2.0
             
     return WeightedRandomSampler(weights, len(weights), replacement=True)
+
+def pad_collate(batch):
+    """
+    Custom collate function to handle mixed 2D/3D batches for nn.DataParallel.
+    Pads the temporal dimension (T) of all items to the maximum T in the batch.
+    Injects dummy targets (-1) to ensure valid stacking across different task types.
+    """
+    max_t = max([item['x'].size(0) for item in batch])
+    has_seg = any(item['seg_target'].numel() > 0 for item in batch)
+    
+    xs = []
+    seg_targets = []
+    
+    for item in batch:
+        x = item['x']
+        st = item['seg_target']
+        
+        # Pad x sequence length with zeros
+        if x.size(0) < max_t:
+            padding = torch.zeros(max_t - x.size(0), x.size(1), x.size(2), x.size(3), dtype=x.dtype)
+            x = torch.cat([x, padding], dim=0)
+        xs.append(x)
+        
+        # Pad seg_targets if ANY sample in the batch has a segmentation task
+        if has_seg:
+            if st.numel() == 0:
+                # Dummy target for classification samples (-1.0 tells the loss function to ignore it)
+                st = torch.full((max_t, 1, 256, 256), -1.0, dtype=torch.float32)
+            elif st.size(0) < max_t:
+                padding = torch.full((max_t - st.size(0), st.size(1), st.size(2), st.size(3)), -1.0, dtype=st.dtype)
+                st = torch.cat([st, padding], dim=0)
+            seg_targets.append(st)
+        else:
+            seg_targets.append(torch.empty(0))
+            
+    return {
+        'x': torch.stack(xs, dim=0),
+        'organ_idx': torch.tensor([item['organ_idx'] for item in batch], dtype=torch.long),
+        'modality_idx': torch.tensor([item['modality_idx'] for item in batch], dtype=torch.long),
+        'is_video': torch.tensor([item['is_video'] for item in batch], dtype=torch.bool),
+        'task': [item['task'] for item in batch],
+        'cls_target': torch.stack([item['cls_target'] for item in batch], dim=0),
+        'seg_target': torch.stack(seg_targets, dim=0) if has_seg else torch.empty(0)
+    }
+

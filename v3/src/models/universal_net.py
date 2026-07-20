@@ -134,55 +134,48 @@ class UniversalNet(nn.Module):
             nn.Conv2d(64, 1, 1) # Single channel output for grayscale masks
         )
 
-    def forward(self, x, organ_idx, modality_idx, is_video=False):
+    def forward(self, x, organ_idx, modality_idx, is_video=None):
         """
-        x: (B, C, H, W) for images OR (B, T, C, H, W) for videos
+        x: (B, T, C, H, W) for all inputs (images are padded to T=1 or max_T)
         """
-        B = x.size(0)
+        B, T, C, H, W = x.shape
         
-        if is_video:
-            T = x.size(1)
-            # Fold time into batch for shared 2D encoding
-            x = x.view(B * T, x.size(2), x.size(3), x.size(4))
+        # Fold time into batch for shared 2D encoding
+        x = x.view(B * T, C, H, W)
             
         # Extract features
         features = self.encoder(x)
         
         # Generate and apply Prompts (FiLM)
         gamma, beta = self.prompter(organ_idx, modality_idx)
-        if is_video:
-            # Duplicate prompts across the time dimension
-            gamma = gamma.repeat_interleave(T, dim=0)
-            beta = beta.repeat_interleave(T, dim=0)
+        
+        # Duplicate prompts across the time dimension
+        gamma = gamma.repeat_interleave(T, dim=0)
+        beta = beta.repeat_interleave(T, dim=0)
             
         features = (features * (1 + gamma)) + beta
         
-        if is_video:
-            # Unfold time and process temporally
-            features = features.view(B, T, features.size(1), features.size(2), features.size(3))
-            temporal_features, final_hidden = self.temporal_module(features)
-            
-            # Classification uses the final temporal state
-            cls_out = self.classifier(self.global_pool(final_hidden).flatten(1))
-            
-            # Segmentation uses all temporal states
-            seg_in = temporal_features.view(B * T, features.size(2), features.size(3), features.size(4))
-            
-            # CHUNK & CHECKPOINT TO SAVE MEMORY ON UPSAMPLING
-            chunk_size = 8
-            seg_out_list = []
-            for i in range(0, B * T, chunk_size):
-                seg_chunk_in = seg_in[i:i+chunk_size]
-                # Use gradient checkpointing to discard intermediate upsampling activations
-                seg_chunk_out = checkpoint(self.segmenter, seg_chunk_in, use_reentrant=False)
-                seg_out_list.append(seg_chunk_out)
-            
-            seg_out = torch.cat(seg_out_list, dim=0)
-            seg_out = seg_out.view(B, T, 1, seg_out.size(2), seg_out.size(3))
-            
-        else:
-            cls_out = self.classifier(self.global_pool(features).flatten(1))
-            seg_out = self.segmenter(features)
+        # Unfold time and process temporally
+        features = features.view(B, T, features.size(1), features.size(2), features.size(3))
+        temporal_features, final_hidden = self.temporal_module(features)
+        
+        # Classification uses the final temporal state
+        cls_out = self.classifier(self.global_pool(final_hidden).flatten(1))
+        
+        # Segmentation uses all temporal states
+        seg_in = temporal_features.view(B * T, features.size(2), features.size(3), features.size(4))
+        
+        # CHUNK & CHECKPOINT TO SAVE MEMORY ON UPSAMPLING
+        chunk_size = 8
+        seg_out_list = []
+        for i in range(0, B * T, chunk_size):
+            seg_chunk_in = seg_in[i:i+chunk_size]
+            # Use gradient checkpointing to discard intermediate upsampling activations
+            seg_chunk_out = checkpoint(self.segmenter, seg_chunk_in, use_reentrant=False)
+            seg_out_list.append(seg_chunk_out)
+        
+        seg_out = torch.cat(seg_out_list, dim=0)
+        seg_out = seg_out.view(B, T, 1, seg_out.size(2), seg_out.size(3))
             
         return cls_out, seg_out
 
