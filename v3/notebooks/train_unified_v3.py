@@ -192,6 +192,11 @@ def train():
     # Fast-forward scheduler if resuming
     last_epoch_step = (start_epoch * total_steps_per_epoch) // grad_steps - 1 if start_epoch > 0 else -1
     
+    # PyTorch requires 'initial_lr' in the optimizer if last_epoch >= 0
+    if last_epoch_step >= 0:
+        for param_group in optimizer.param_groups:
+            param_group.setdefault('initial_lr', 1e-3)
+            
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, 
         max_lr=1e-3, 
