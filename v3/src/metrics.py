@@ -38,14 +38,20 @@ def compute_dice(preds, targets):
     pred_bin = (pred_sig > 0.5).float()
     targs_clean = targets.clamp(min=0.0) * valid_mask
     
-    intersection = (pred_bin * targs_clean).sum(dim=(2, 3))
-    union = pred_bin.sum(dim=(2, 3)) + targs_clean.sum(dim=(2, 3))
+    # Sum over Spatial and Channel dims (C, H, W) -> dims (2, 3, 4)
+    intersection = (pred_bin * targs_clean).sum(dim=(2, 3, 4)) # Shape: (B, T)
+    union = pred_bin.sum(dim=(2, 3, 4)) + targs_clean.sum(dim=(2, 3, 4)) # Shape: (B, T)
     
-    frame_has_target = valid_mask.sum(dim=(1, 2, 3)) > 0
+    # A frame is valid if it has any non-padding pixels
+    frame_has_target = valid_mask.sum(dim=(2, 3, 4)) > 0 # Shape: (B, T)
+    
     if not frame_has_target.any():
         return 0.0, 0
         
-    dice = (2. * intersection[frame_has_target] / (union[frame_has_target] + 1e-5)).sum().item()
+    # Calculate dice per frame
+    dice_per_frame = (2. * intersection) / (union + 1e-5)
+    
+    dice = dice_per_frame[frame_has_target].sum().item()
     total_frames = frame_has_target.sum().item()
     
     return dice, total_frames
