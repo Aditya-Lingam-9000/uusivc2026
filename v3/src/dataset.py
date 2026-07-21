@@ -34,19 +34,29 @@ class UniversalDataset(Dataset):
         self.samples = []
         
         # Load the ground truth JSON based on split
-        if split == 'Train':
+        if split in ['Train', 'Val']:
             json_path = os.path.join(data_dir, 'dataset_json_fingerprints_v4', 'private_train_ground_truth.json')
             pub_json_path = os.path.join(data_dir, 'dataset_json_fingerprints_v4', 'public_all_ground_truth.json')
             
-            # Load private train
+            all_samples = []
             if os.path.exists(json_path):
                 with open(json_path, 'r') as f:
-                    self.samples.extend(json.load(f))
-            # Load public all (as additional training data)
+                    all_samples.extend(json.load(f))
             if os.path.exists(pub_json_path):
                 with open(pub_json_path, 'r') as f:
-                    self.samples.extend(json.load(f))
+                    all_samples.extend(json.load(f))
+                    
+            import random
+            rng = random.Random(42)
+            rng.shuffle(all_samples)
+            
+            split_idx = int(len(all_samples) * 0.9)
+            if split == 'Train':
+                self.samples = all_samples[:split_idx]
+            else:
+                self.samples = all_samples[split_idx:]
         else:
+            # Fallback to Test (submission) json if it exists
             json_path = os.path.join(data_dir, 'dataset_json_fingerprints_v4', 'private_val_for_participants.json')
             if os.path.exists(json_path):
                 with open(json_path, 'r') as f:

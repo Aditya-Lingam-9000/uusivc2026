@@ -134,7 +134,8 @@ def train():
     
     # 3. Initialize Unified Dataset
     train_dir = os.environ.get('UUSIVC_TRAIN_DIR', '/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN')
-    val_dir = os.environ.get('UUSIVC_VAL_DIR', '/kaggle/input/datasets/jyothiradithyalingam/uusivc-val-zip/VAL')
+    # Use train_dir for both because we now dynamically split the TRAIN ground truth JSONs
+    val_dir = train_dir
     
     if not os.path.exists(os.path.join(train_dir, 'dataset_json_fingerprints_v4')):
         print(f"Warning: Train data directory {train_dir} not found. Skipping data loading for local test.")
@@ -152,11 +153,32 @@ def train():
     
     # Batch size 2 allows multi-GPU!
     batch_size = 2 if num_gpus > 1 else 1
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=4, collate_fn=pad_collate)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=pad_collate)
+    
+    # Reduced num_workers to 2 to prevent CPU RAM OOM during long epochs
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=2, collate_fn=pad_collate)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, collate_fn=pad_collate)
     
     scaler = torch.amp.GradScaler('cuda')
     
+    # Check for resuming
+    start_epoch = int(os.environ.get('UUSIVC_START_EPOCH', '0'))
+    if start_epoch > 0:
+        resume_weight_path = os.environ.get('UUSIVC_RESUME_WEIGHTS', f'./weights/v3_universal_model_ep{start_epoch}.pth')
+        print(f"Resuming training from Epoch {start_epoch + 1}. Loading weights: {resume_weight_path}")
+        if os.path.exists(resume_weight_path):
+            state_dict = torch.load(resume_weight_path, map_location=device, weights_only=False)
+            model.load_state_dict(state_dict)
+            print("Weights loaded successfully!")
+            
+            print("\n==================================================")
+            print(f"Running Validation on Loaded Epoch {start_epoch} Weights...")
+            if len(val_loader) > 0:
+                evaluate(model, val_loader, device)
+            else:
+                print("Validation loader is empty.")
+        else:
+            print(f"WARNING: Could not find resume weights at {resume_weight_path}")
+            
     # 4. Training Loop
     epochs = 10
     total_steps_per_epoch = len(train_loader)
@@ -166,19 +188,24 @@ def train():
     
     # ADVANCED OPTIMIZATION: OneCycleLR Scheduler
     total_optimization_steps = (total_steps_per_epoch * epochs) // grad_steps
+    
+    # Fast-forward scheduler if resuming
+    last_epoch_step = (start_epoch * total_steps_per_epoch) // grad_steps - 1 if start_epoch > 0 else -1
+    
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, 
         max_lr=1e-3, 
         total_steps=total_optimization_steps, 
         pct_start=0.1, 
-        anneal_strategy='cos'
+        anneal_strategy='cos',
+        last_epoch=last_epoch_step
     )
     
     model.train()
     
     global_start_time = time.time()
     
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         epoch_loss = 0.0
         running_loss = 0.0
         epoch_start_time = time.time()
