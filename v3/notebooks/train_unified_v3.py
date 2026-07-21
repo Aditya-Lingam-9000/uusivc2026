@@ -127,10 +127,15 @@ def train():
     if num_gpus > 1:
         model = torch.nn.DataParallel(model)
         
-    criterion = UniversalLoss(lambda_seg=1.0, lambda_bnd=0.5, lambda_cls=1.0, lambda_temp=0.1).to(device)
+    criterion = UniversalLoss().to(device)
     
     # ADVANCED OPTIMIZATION: AdamW with tuned parameters for Swin Transformer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.05)
+    # Add criterion parameters so the learnable task weights (log_vars) are optimized
+    optimizer = torch.optim.AdamW(
+        list(model.parameters()) + list(criterion.parameters()), 
+        lr=1e-3, 
+        weight_decay=0.05
+    )
     
     # 3. Initialize Unified Dataset
     train_dir = os.environ.get('UUSIVC_TRAIN_DIR', '/kaggle/input/datasets/jyothiradithyalingam/uusivc-train-zip/TRAIN')

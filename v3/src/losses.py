@@ -76,16 +76,20 @@ class TemporalConsistencyLoss(nn.Module):
 
 
 class UniversalLoss(nn.Module):
-    def __init__(self, lambda_seg=1.0, lambda_bnd=0.5, lambda_cls=1.0, lambda_temp=0.1):
+    def __init__(self, init_weight=0.0):
         super().__init__()
-        self.lambda_seg = lambda_seg
-        self.lambda_bnd = lambda_bnd
-        self.lambda_cls = lambda_cls
-        self.lambda_temp = lambda_temp
+        # Dynamic Task Weighting via Homoscedastic Uncertainty
+        self.log_var_cls = nn.Parameter(torch.tensor(init_weight))
+        self.log_var_seg = nn.Parameter(torch.tensor(init_weight))
+        self.log_var_bnd = nn.Parameter(torch.tensor(init_weight))
+        self.log_var_temp = nn.Parameter(torch.tensor(init_weight))
         
         self.cls_loss_fn = ClassBalancedFocalLoss()
         self.bnd_loss_fn = BoundaryLoss()
         self.temp_loss_fn = TemporalConsistencyLoss()
+        
+        # Massive penalty for missing tiny tumors (Class Imbalance)
+        self.register_buffer('pos_weight', torch.tensor([10.0]))
 
     def forward(self, cls_preds, cls_targets, seg_preds, seg_targets):
         """
@@ -101,7 +105,7 @@ class UniversalLoss(nn.Module):
         if cls_targets is not None and cls_targets.numel() > 0 and (cls_targets >= 0).any():
             valid_mask = cls_targets >= 0
             cls_loss = self.cls_loss_fn(cls_preds[valid_mask], cls_targets[valid_mask])
-            total_loss += self.lambda_cls * cls_loss
+            total_loss += (cls_loss * torch.exp(-self.log_var_cls) + self.log_var_cls)
             
         # 2. Segmentation Loss (Dice + BCE + Boundary)
         if seg_targets is not None and seg_targets.numel() > 0:
@@ -116,8 +120,13 @@ class UniversalLoss(nn.Module):
             
             # If there's at least one valid pixel to segment
             if valid_mask.sum() > 0:
-                # Compute BCE loss (unreduced)
-                bce_loss = F.binary_cross_entropy_with_logits(s_preds, s_targs.clamp(min=0.0), reduction='none')
+                # Compute BCE loss (unreduced) with massive foreground penalty
+                bce_loss = F.binary_cross_entropy_with_logits(
+                    s_preds, 
+                    s_targs.clamp(min=0.0), 
+                    pos_weight=self.pos_weight,
+                    reduction='none'
+                )
                 bce_loss = (bce_loss * valid_mask).sum() / (valid_mask.sum() + 1e-8)
                 
                 # Compute Dice Loss
@@ -134,16 +143,16 @@ class UniversalLoss(nn.Module):
                     
                     # Boundary Loss (for NSD)
                     bnd_loss = self.bnd_loss_fn(s_preds[frame_has_target], targs_clean[frame_has_target])
-                    total_loss += self.lambda_bnd * bnd_loss
+                    total_loss += (bnd_loss * torch.exp(-self.log_var_bnd) + self.log_var_bnd)
                 else:
                     dice_loss = 0.0
                     
                 seg_loss = bce_loss + dice_loss
-                total_loss += self.lambda_seg * seg_loss
+                total_loss += (seg_loss * torch.exp(-self.log_var_seg) + self.log_var_seg)
             
             # 3. Temporal Consistency Loss (Videos Only)
             if T > 1:
                 temp_loss = self.temp_loss_fn(seg_preds)
-                total_loss += self.lambda_temp * temp_loss
+                total_loss += (temp_loss * torch.exp(-self.log_var_temp) + self.log_var_temp)
                 
         return total_loss
