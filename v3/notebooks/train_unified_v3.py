@@ -3,12 +3,31 @@ import sys
 import time
 import requests
 import gc
+import subprocess
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Add parent directory to path for v3 imports
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Auto-install essential dependencies if missing in environment
+try:
+    import yacs
+except ImportError:
+    subprocess.run([sys.executable, "-m", "pip", "install", "yacs", "timm", "einops", "-q"])
+
+# Robustly search and append v3 module directories to sys.path
+v3_candidate_paths = [
+    os.path.abspath(os.path.join(os.path.dirname(__file__), '..')),
+    os.path.abspath(os.path.join(os.getcwd(), 'uusivc2026', 'v3')),
+    os.path.abspath(os.path.join(os.getcwd(), 'v3')),
+    '/kaggle/working/uusivc2026/v3'
+]
+
+for p in v3_candidate_paths:
+    if os.path.exists(os.path.join(p, 'src')):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+        break
+
 from src.models.universal_net import UniversalNet
 from src.dataset import UniversalDataset, get_balanced_sampler, pad_collate
 from src.losses import UniversalLoss

@@ -1,13 +1,36 @@
 import os
 import sys
+import subprocess
+
+# Auto-install essential dependencies if missing in environment
+try:
+    import yacs
+except ImportError:
+    subprocess.run([sys.executable, "-m", "pip", "install", "yacs", "timm", "einops", "-q"])
+
+# Robustly search for UniUSNet directory across all potential execution paths
+possible_uniusnet_paths = [
+    os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'UniUSNet')),
+    os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'UniUSNet')),
+    os.path.abspath(os.path.join(os.getcwd(), 'uusivc2026', 'v3', 'UniUSNet')),
+    os.path.abspath(os.path.join(os.getcwd(), 'v3', 'UniUSNet')),
+    '/kaggle/working/uusivc2026/v3/UniUSNet'
+]
+
+UNIUSNET_DIR = None
+for p in possible_uniusnet_paths:
+    if os.path.exists(os.path.join(p, 'config.py')):
+        UNIUSNET_DIR = p
+        if p not in sys.path:
+            sys.path.insert(0, p)
+        break
+
+if UNIUSNET_DIR is None:
+    raise RuntimeError("Could not locate official UniUSNet codebase directory containing 'config.py'.")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# Dynamically append UniUSNet directory to sys.path
-UNIUSNET_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'UniUSNet'))
-if UNIUSNET_DIR not in sys.path:
-    sys.path.insert(0, UNIUSNET_DIR)
 
 from config import get_config
 from networks.omni_vision_transformer import OmniVisionTransformer
@@ -80,7 +103,6 @@ class UniversalNet(nn.Module):
 
 
 if __name__ == "__main__":
-    # Dry-run compilation test
     model = UniversalNet()
     img_x = torch.randn(2, 1, 3, 224, 224)
     pos_p = torch.zeros(2, 8)
