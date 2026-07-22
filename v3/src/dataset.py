@@ -86,9 +86,7 @@ class UniversalDataset(Dataset):
         # Parse metadata
         task = item['task']
         organ_name = item['dataset_name']
-        organ_idx = ORGAN_MAPPING.get(organ_name, 0)
-        modality_idx = MODALITY_MAPPING.get(task, 0)
-        is_video = (modality_idx > 0)
+        is_video = task in ['ceus_cls', 'ceus_seg', 'video_seg']
         
         # Map JSON partition names to actual physical directory names
         DIR_MAPPING = {
