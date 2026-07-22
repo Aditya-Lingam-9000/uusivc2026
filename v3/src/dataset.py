@@ -146,8 +146,14 @@ class UniversalDataset(Dataset):
                     npz_data = np.load(target_path, allow_pickle=True)
                     if 'fnum_mask' in npz_data:
                         fnum_dict = npz_data['fnum_mask'].item()
-                        T, H, W = x.shape[0], x.shape[2], x.shape[3]
-                        mask_data = np.zeros((T, 1, H, W), dtype=np.float32)
+                        if len(fnum_dict) > 0:
+                            first_v = next(iter(fnum_dict.values()))
+                            orig_H, orig_W = first_v.shape[0], first_v.shape[1]
+                        else:
+                            orig_H, orig_W = x.shape[2], x.shape[3]
+                            
+                        T = x.shape[0]
+                        mask_data = np.zeros((T, 1, orig_H, orig_W), dtype=np.float32)
                         for k, v in fnum_dict.items():
                             idx = int(k)
                             if idx < T:
