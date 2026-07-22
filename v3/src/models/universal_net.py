@@ -94,8 +94,24 @@ class UniversalNet(nn.Module):
         type_p = type_prompt.repeat_interleave(T, dim=0)
         nat_p = nature_prompt.repeat_interleave(T, dim=0)
         
-        # Pass through official Swin Omni Vision Transformer
-        x_seg, x_cls = self.net.swin((x_flat, pos_p, task_p, type_p, nat_p))
+        # Chunk frame processing to maintain VRAM < 2GB even on 100-frame video sequences
+        chunk_size = 4
+        x_seg_list = []
+        x_cls_list = []
+        
+        for i in range(0, B * T, chunk_size):
+            x_chunk = x_flat[i:i+chunk_size]
+            pos_chunk = pos_p[i:i+chunk_size]
+            task_chunk = task_p[i:i+chunk_size]
+            type_chunk = type_p[i:i+chunk_size]
+            nat_chunk = nat_p[i:i+chunk_size]
+            
+            seg_chunk, cls_chunk = self.net.swin((x_chunk, pos_chunk, task_chunk, type_chunk, nat_chunk))
+            x_seg_list.append(seg_chunk)
+            x_cls_list.append(cls_chunk)
+            
+        x_seg = torch.cat(x_seg_list, dim=0)
+        x_cls = torch.cat(x_cls_list, dim=0)
         
         # Process segmentation output (B*T, num_classes, H, W) -> (B, T, 1, H, W)
         if x_seg.size(1) == 2:
