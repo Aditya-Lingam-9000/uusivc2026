@@ -7,18 +7,32 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 # Define mappings from organ names to indices for Prompt embedding
-ORGAN_MAPPING = {
-    'Appendix': 0, 'Breast': 1, 'Liver': 2, 'Prostate': 3, 'Thyroid': 4,
-    'Breast_luminal': 5, 'Cardiac': 6, 'Fetal_Head': 7, 'Kidney': 8,
-    'BreastCEUS': 9, 'LiverCEUS': 10, 'ProstateCEUS': 11, 'ThyroidCEUS': 12, 'CardiacCH': 13,
-    'BUS-BRA': 1, 'BUSI': 1, 'Fatty-Liver': 2, 'BUSIS': 1, 'DDTI': 4, 'Fetal_HC': 7, 'KidneyUS': 8, 'CAMUS': 6
+# Define prompt dictionaries based on hosters' official specification
+POSITION_PROMPT_ONE_HOT = {
+    'breast': [1, 0, 0, 0, 0, 0, 0, 0],
+    'cardiac': [0, 1, 0, 0, 0, 0, 0, 0],
+    'thyroid': [0, 0, 1, 0, 0, 0, 0, 0],
+    'head': [0, 0, 0, 1, 0, 0, 0, 0],
+    'kidney': [0, 0, 0, 0, 1, 0, 0, 0],
+    'appendix': [0, 0, 0, 0, 0, 1, 0, 0],
+    'liver': [0, 0, 0, 0, 0, 0, 1, 0],
+    'indis': [0, 0, 0, 0, 0, 0, 0, 1]
 }
 
-# Modality: 0 = Image, 1 = CEUS Video, 2 = Cardiac Video
-MODALITY_MAPPING = {
-    'image_cls': 0, 'image_seg': 0,
-    'ceus_cls': 1, 'ceus_seg': 1,
-    'video_seg': 2
+ORGAN_TO_POSITION = {
+    'Breast': 'breast', 'BreastCEUS': 'breast', 'BUS-BRA': 'breast', 'BUSI': 'breast', 'BUSIS': 'breast', 'UDIAT': 'breast', 'Breast_luminal': 'breast',
+    'Cardiac': 'cardiac', 'CAMUS': 'cardiac', 'CardiacCH': 'cardiac',
+    'Thyroid': 'thyroid', 'ThyroidCEUS': 'thyroid', 'DDTI': 'thyroid',
+    'Fetal_Head': 'head', 'Fetal_HC': 'head',
+    'Kidney': 'kidney', 'KidneyUS': 'kidney',
+    'Appendix': 'appendix',
+    'Liver': 'liver', 'LiverCEUS': 'liver', 'Fatty-Liver': 'liver',
+    'Prostate': 'indis', 'ProstateCEUS': 'indis'
+}
+
+ORGAN_TO_NATURE = {
+    'Breast': 'tumor', 'BreastCEUS': 'tumor', 'BUS-BRA': 'tumor', 'BUSI': 'tumor', 'BUSIS': 'tumor', 'Thyroid': 'tumor', 'ThyroidCEUS': 'tumor', 'DDTI': 'tumor', 'Prostate': 'tumor', 'ProstateCEUS': 'tumor', 'Breast_luminal': 'tumor',
+    'Cardiac': 'organ', 'CAMUS': 'organ', 'CardiacCH': 'organ', 'Fetal_Head': 'organ', 'Fetal_HC': 'organ', 'Kidney': 'organ', 'KidneyUS': 'organ', 'Appendix': 'organ', 'Liver': 'organ', 'LiverCEUS': 'organ', 'Fatty-Liver': 'organ'
 }
 
 TASK_MAPPING = {
@@ -108,14 +122,14 @@ class UniversalDataset(Dataset):
                 
             x = torch.from_numpy(video_data).float() / 255.0
             
-            # Ensure spatial dimensions are strictly 256x256
-            if x.shape[2] != 256 or x.shape[3] != 256:
-                x = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=False)
+            # Ensure spatial dimensions match native Swin (224x224)
+            if x.shape[2] != 224 or x.shape[3] != 224:
+                x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
         else:
             # Image inputs are stored as .jpg or .png
             img = Image.open(input_path).convert('RGB')
-            # Basic resize for unified backbone
-            img = img.resize((256, 256)) 
+            # Resize for native Swin window attention (224x224)
+            img = img.resize((224, 224)) 
             x = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
             x = x.unsqueeze(0) # (1, C, H, W) to treat as a 1-frame video
 
@@ -141,8 +155,8 @@ class UniversalDataset(Dataset):
                             if idx < T:
                                 mask_data[idx, 0] = v
                         seg_target = torch.from_numpy(mask_data).float() / 255.0
-                        if seg_target.shape[2] != 256 or seg_target.shape[3] != 256:
-                            seg_target = F.interpolate(seg_target, size=(256, 256), mode='nearest')
+                        if seg_target.shape[2] != 224 or seg_target.shape[3] != 224:
+                            seg_target = F.interpolate(seg_target, size=(224, 224), mode='nearest')
                     else:
                         mask_data = npz_data['mask']
                         if len(mask_data.shape) == 3: # (T, H, W)
@@ -152,11 +166,11 @@ class UniversalDataset(Dataset):
                             mask_data = np.expand_dims(mask_data, axis=0)
                             mask_data = np.repeat(mask_data, x.shape[0], axis=0)
                         seg_target = torch.from_numpy(mask_data).float() / 255.0
-                        if seg_target.shape[2] != 256 or seg_target.shape[3] != 256:
-                            seg_target = F.interpolate(seg_target, size=(256, 256), mode='nearest')
+                        if seg_target.shape[2] != 224 or seg_target.shape[3] != 224:
+                            seg_target = F.interpolate(seg_target, size=(224, 224), mode='nearest')
                 else:
                     mask = Image.open(target_path).convert('L')
-                    mask = mask.resize((256, 256))
+                    mask = mask.resize((224, 224))
                     seg_target = torch.from_numpy(np.array(mask)).unsqueeze(0).float() / 255.0
                     seg_target = seg_target.unsqueeze(0) # (1, 1, H, W)
 
@@ -191,10 +205,24 @@ class UniversalDataset(Dataset):
                 noise = torch.randn_like(x) * 0.05
                 x = torch.clamp(x + noise, 0.0, 1.0)
                 
+        # Build official prompt vectors
+        pos_str = ORGAN_TO_POSITION.get(organ_name, 'indis')
+        position_prompt = torch.tensor(POSITION_PROMPT_ONE_HOT.get(pos_str, [0, 0, 0, 0, 0, 0, 0, 1]), dtype=torch.float32)
+        
+        is_seg_task = 'seg' in task
+        task_prompt = torch.tensor([1, 0] if is_seg_task else [0, 1], dtype=torch.float32)
+        
+        nature_str = ORGAN_TO_NATURE.get(organ_name, 'organ')
+        nature_prompt = torch.tensor([1, 0] if nature_str == 'tumor' else [0, 1], dtype=torch.float32)
+        
+        type_prompt = torch.tensor([1, 0, 0], dtype=torch.float32) # 'whole'
+        
         return {
             'x': x,
-            'organ_idx': organ_idx,
-            'modality_idx': modality_idx,
+            'position_prompt': position_prompt,
+            'task_prompt': task_prompt,
+            'nature_prompt': nature_prompt,
+            'type_prompt': type_prompt,
             'is_video': is_video,
             'task': TASK_MAPPING.get(task, 0),
             'cls_target': cls_target.squeeze(),
@@ -264,7 +292,7 @@ def pad_collate(batch):
         if has_seg:
             if st.numel() == 0:
                 # Dummy target for classification samples (-1.0 tells the loss function to ignore it)
-                st = torch.full((max_t, 1, 256, 256), -1.0, dtype=torch.float32)
+                st = torch.full((max_t, 1, 224, 224), -1.0, dtype=torch.float32)
             elif st.size(0) < max_t:
                 padding = torch.full((max_t - st.size(0), st.size(1), st.size(2), st.size(3)), -1.0, dtype=st.dtype)
                 st = torch.cat([st, padding], dim=0)
@@ -274,8 +302,10 @@ def pad_collate(batch):
             
     return {
         'x': torch.stack(xs, dim=0),
-        'organ_idx': torch.tensor([item['organ_idx'] for item in batch], dtype=torch.long),
-        'modality_idx': torch.tensor([item['modality_idx'] for item in batch], dtype=torch.long),
+        'position_prompt': torch.stack([item['position_prompt'] for item in batch], dim=0),
+        'task_prompt': torch.stack([item['task_prompt'] for item in batch], dim=0),
+        'nature_prompt': torch.stack([item['nature_prompt'] for item in batch], dim=0),
+        'type_prompt': torch.stack([item['type_prompt'] for item in batch], dim=0),
         'is_video': torch.tensor([item['is_video'] for item in batch], dtype=torch.bool),
         'task': torch.tensor([item['task'] for item in batch], dtype=torch.long),
         'cls_target': torch.stack([item['cls_target'] for item in batch], dim=0),
