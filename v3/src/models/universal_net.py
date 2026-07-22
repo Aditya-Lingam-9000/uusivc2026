@@ -25,8 +25,15 @@ for p in possible_uniusnet_paths:
             sys.path.insert(0, p)
         break
 
+# Fallback: Auto-clone official UniUSNet repository from GitHub if not present
 if UNIUSNET_DIR is None:
-    raise RuntimeError("Could not locate official UniUSNet codebase directory containing 'config.py'.")
+    clone_target = os.path.abspath(os.path.join(os.getcwd(), 'uusivc2026', 'v3', 'UniUSNet'))
+    if not os.path.exists(clone_target):
+        print(f"UniUSNet codebase not found locally. Auto-cloning to {clone_target}...")
+        subprocess.run(["git", "clone", "https://github.com/Zehui-Lin/UniUSNet.git", clone_target], check=True)
+    UNIUSNET_DIR = clone_target
+    if UNIUSNET_DIR not in sys.path:
+        sys.path.insert(0, UNIUSNET_DIR)
 
 import torch
 import torch.nn as nn
