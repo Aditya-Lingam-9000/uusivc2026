@@ -30,6 +30,7 @@ TASK_MAPPING = {
 class UniversalDataset(Dataset):
     def __init__(self, data_dir, split='Train', transform=None):
         self.data_dir = data_dir
+        self.split = split
         self.transform = transform
         self.samples = []
         
@@ -159,6 +160,37 @@ class UniversalDataset(Dataset):
                     seg_target = torch.from_numpy(np.array(mask)).unsqueeze(0).float() / 255.0
                     seg_target = seg_target.unsqueeze(0) # (1, 1, H, W)
 
+        # Ensure single channel targets are padded to full shape
+        if seg_target.numel() == 0:
+            seg_target = torch.full((x.shape[0], 1, x.shape[2], x.shape[3]), -1.0)
+            
+        # ==========================================
+        # AGGRESSIVE DATA AUGMENTATION (TRAIN ONLY)
+        # ==========================================
+        if self.split == 'Train':
+            # 1. Random Horizontal Flip (Sync between Image and Mask)
+            if torch.rand(1).item() > 0.5:
+                x = torch.flip(x, dims=[-1])
+                if (seg_target != -1.0).any():
+                    seg_target = torch.flip(seg_target, dims=[-1])
+                    
+            # 2. Random Vertical Flip
+            if torch.rand(1).item() > 0.5:
+                x = torch.flip(x, dims=[-2])
+                if (seg_target != -1.0).any():
+                    seg_target = torch.flip(seg_target, dims=[-2])
+            
+            # 3. Color Jitter (Images only, doesn't affect mask)
+            import torchvision.transforms as T
+            jitter = T.ColorJitter(brightness=0.3, contrast=0.3)
+            # Apply to each frame independently
+            x = torch.stack([jitter(frame) for frame in x])
+            
+            # 4. Random Noise Injection
+            if torch.rand(1).item() > 0.5:
+                noise = torch.randn_like(x) * 0.05
+                x = torch.clamp(x + noise, 0.0, 1.0)
+                
         return {
             'x': x,
             'organ_idx': organ_idx,

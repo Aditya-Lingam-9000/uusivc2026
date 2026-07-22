@@ -1,6 +1,7 @@
 import os
 import torch
 import requests
+import gc
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -130,11 +131,11 @@ def train():
     criterion = UniversalLoss().to(device)
     
     # ADVANCED OPTIMIZATION: AdamW with tuned parameters for Swin Transformer
-    # Add criterion parameters so the learnable task weights (log_vars) are optimized
+    # Increased weight_decay to 0.1 to aggressively combat Catastrophic Overfitting
     optimizer = torch.optim.AdamW(
         list(model.parameters()) + list(criterion.parameters()), 
         lr=1e-3, 
-        weight_decay=0.05
+        weight_decay=0.1
     )
     
     # 3. Initialize Unified Dataset
@@ -159,9 +160,10 @@ def train():
     # Batch size 2 allows multi-GPU!
     batch_size = 2 if num_gpus > 1 else 1
     
-    # Reduced num_workers to 2 to prevent CPU RAM OOM during long epochs
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=2, collate_fn=pad_collate)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, collate_fn=pad_collate)
+    # BULLETPROOF RAM FIX: num_workers=0 strictly forces data loading into the main thread.
+    # This completely eliminates PyTorch multiprocessing copy-on-write memory leaks over 10 hours.
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=0, collate_fn=pad_collate)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=pad_collate)
     
     scaler = torch.amp.GradScaler('cuda')
     
@@ -220,6 +222,19 @@ def train():
         running_loss = 0.0
         epoch_start_time = time.time()
         
+        # REGULARIZATION: Freeze the Swin Backbone for the first 3 epochs to prevent destroying ImageNet weights
+        if epoch < 3:
+            print("[REGULARIZATION] Epoch < 3: Freezing Swin Encoder to prevent Catastrophic Overfitting.")
+            # Handle DataParallel wrapper if present
+            actual_model = model.module if hasattr(model, 'module') else model
+            for param in actual_model.encoder.parameters():
+                param.requires_grad = False
+        else:
+            print("[REGULARIZATION] Epoch >= 3: Unfreezing Swin Encoder for fine-tuning.")
+            actual_model = model.module if hasattr(model, 'module') else model
+            for param in actual_model.encoder.parameters():
+                param.requires_grad = True
+                
         print(f"\n[EPOCH {epoch+1}/{epochs}] Started...")
         
         for step, batch in enumerate(train_loader):
@@ -255,6 +270,10 @@ def train():
                 loss_val = loss.item() * grad_steps
                 epoch_loss += loss_val
                 running_loss += loss_val
+                
+            # Aggressive Garbage Collection to prevent CPU RAM leaks from piling up
+            if (step + 1) % 500 == 0:
+                gc.collect()
                 
             # Manual Logging every 100 steps
             if (step + 1) % 100 == 0 or (step + 1) == total_steps_per_epoch:
