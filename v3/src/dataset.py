@@ -182,6 +182,21 @@ class UniversalDataset(Dataset):
         if seg_target.numel() == 0:
             seg_target = torch.full((x.shape[0], 1, x.shape[2], x.shape[3]), -1.0)
             
+        # Temporal Subsampling for Videos (Prevents GPU VRAM OOM on long sequences)
+        max_frames = 16
+        if is_video and x.shape[0] > max_frames:
+            if self.split == 'Train':
+                # Random starting offset for dynamic temporal augmentation
+                max_start = x.shape[0] - max_frames
+                start_idx = torch.randint(0, max_start + 1, (1,)).item()
+                indices = list(range(start_idx, start_idx + max_frames))
+            else:
+                indices = np.linspace(0, x.shape[0] - 1, max_frames, dtype=int).tolist()
+                
+            x = x[indices]
+            if seg_target.shape[0] > max_frames:
+                seg_target = seg_target[indices]
+            
         # ==========================================
         # AGGRESSIVE DATA AUGMENTATION (TRAIN ONLY)
         # ==========================================

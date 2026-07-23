@@ -1,4 +1,5 @@
 import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 import sys
 import time
 import requests
@@ -250,8 +251,9 @@ def train():
                 epoch_loss += loss_val
                 running_loss += loss_val
                 
-            if (step + 1) % 500 == 0:
+            if (step + 1) % 200 == 0:
                 gc.collect()
+                torch.cuda.empty_cache()
                 
             if (step + 1) % 100 == 0 or (step + 1) == total_steps_per_epoch:
                 avg_loss = running_loss / 100 if (step + 1) % 100 == 0 else running_loss / ((step + 1) % 100)
