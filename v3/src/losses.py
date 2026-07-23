@@ -4,10 +4,9 @@ import torch.nn.functional as F
 
 class ClassBalancedFocalLoss(nn.Module):
     """
-    Focal loss to handle severe class imbalance, specifically targeted at 
-    Liver (4.46:1) and Prostate (0.36:1) classification tasks.
+    Focal loss to handle class imbalance across multi-organ classification tasks.
     """
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+    def __init__(self, alpha=1.0, gamma=1.5, reduction='mean'):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -105,7 +104,8 @@ class UniversalLoss(nn.Module):
         if cls_targets is not None and cls_targets.numel() > 0 and (cls_targets >= 0).any():
             valid_mask = cls_targets >= 0
             cls_loss = self.cls_loss_fn(cls_preds[valid_mask], cls_targets[valid_mask])
-            total_loss += (cls_loss * torch.exp(-self.log_var_cls) + self.log_var_cls)
+            # Multiplied by 5.0x to balance classification gradients against 50,176-pixel segmentation gradients
+            total_loss += (5.0 * cls_loss * torch.exp(-self.log_var_cls) + self.log_var_cls)
             
         # 2. Segmentation Loss (Dice + BCE + Boundary)
         if seg_targets is not None and seg_targets.numel() > 0:
