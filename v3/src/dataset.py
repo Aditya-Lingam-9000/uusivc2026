@@ -189,7 +189,8 @@ class UniversalDataset(Dataset):
             seg_target = torch.full((x.shape[0], 1, IMG_SIZE, IMG_SIZE), -1.0)
             
         # Temporal Subsampling for Videos (Prevents GPU VRAM OOM on long sequences)
-        max_frames = 16
+        # max_frames=8: halves swin forward passes vs max_frames=16, 2× speedup
+        max_frames = 8
         if is_video and x.shape[0] > max_frames:
             if self.split == 'Train':
                 # Random starting offset for dynamic temporal augmentation

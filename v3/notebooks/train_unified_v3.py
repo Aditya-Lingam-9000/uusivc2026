@@ -254,7 +254,15 @@ def train():
     # ── 5. Training hyperparameters ──────────────────────────────────────────
     total_epochs        = int(os.environ.get('UUSIVC_TOTAL_EPOCHS', '100'))
     grad_steps          = 8          # effective batch = batch_size × grad_steps
-    total_steps_per_epoch = len(train_loader)
+
+    # Cap steps per epoch so training doesn't take 500 min/epoch.
+    # The weighted sampler loops infinitely, so we just stop after N steps.
+    # Default 300: at ~4s/step → ~20 min/epoch, 100 epochs → ~33 hrs total.
+    # Set UUSIVC_STEPS_PER_EPOCH=500 for more coverage at cost of longer epochs.
+    full_loader_len     = len(train_loader)   # actual dataset size
+    steps_per_epoch     = int(os.environ.get('UUSIVC_STEPS_PER_EPOCH',
+                                              min(300, full_loader_len)))
+    print(f"Dataset has {full_loader_len} batches. Capping epoch at {steps_per_epoch} steps.")
 
     # ── 6. Schedulers — CosineAnnealingWarmRestarts ──────────────────────────
     # Schedules operate on epoch-level, not step-level.
@@ -350,8 +358,15 @@ def train():
 
         optimizer_seg.zero_grad()
         optimizer_cls.zero_grad()
+        train_iter = iter(train_loader)   # fresh iterator each epoch (sampler re-shuffles)
 
-        for step, batch in enumerate(train_loader):
+        for step in range(steps_per_epoch):
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                batch = next(train_iter)
+
             x          = batch['x'].to(device)
             pos_p      = batch['position_prompt'].to(device)
             task_p     = batch['task_prompt'].to(device)
@@ -372,7 +387,7 @@ def train():
             if loss > 0:
                 scaler.scale(loss).backward()
 
-                if (step + 1) % grad_steps == 0 or (step + 1) == total_steps_per_epoch:
+                if (step + 1) % grad_steps == 0 or (step + 1) == steps_per_epoch:
                     # Gradient clipping for stability
                     scaler.unscale_(optimizer_seg)
                     scaler.unscale_(optimizer_cls)
@@ -406,7 +421,7 @@ def train():
                 vram_used  = torch.cuda.memory_allocated(device) / (1024 ** 3)
                 vram_res   = torch.cuda.memory_reserved(device) / (1024 ** 3)
 
-                print(f"  Step [{step+1}/{total_steps_per_epoch}] "
+                print(f"  Step [{step+1}/{steps_per_epoch}] "
                       f"| Loss: {avg_loss:.4f} "
                       f"| LR_seg: {scheduler_seg.get_last_lr()[0]:.6f} "
                       f"| LR_cls: {scheduler_cls.get_last_lr()[0]:.6f} "

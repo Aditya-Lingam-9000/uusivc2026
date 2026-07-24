@@ -105,8 +105,8 @@ class UniversalNet(nn.Module):
         type_p = type_prompt.repeat_interleave(T, dim=0)
         nat_p = nature_prompt.repeat_interleave(T, dim=0)
         
-        # Ultra-lean chunk frame processing to keep VRAM < 1GB
-        chunk_size = 2
+        # chunk_size=4: processes 4 frames per swin call, halves loop overhead vs chunk_size=2
+        chunk_size = 4
         x_seg_list = []
         x_cls_list = []
         
