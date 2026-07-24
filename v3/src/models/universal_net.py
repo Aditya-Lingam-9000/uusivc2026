@@ -122,8 +122,10 @@ class UniversalNet(nn.Module):
             x_cls_list.append(cls_chunk)
             
         x_seg = torch.cat(x_seg_list, dim=0)  # (B*T, num_classes, H, W)
-        x_cls = torch.cat(x_cls_list, dim=0)  # (B*T, embed_dim)
-        
+        # NOTE: x_cls from self.net.swin() is ALREADY the final logits (B*T, num_classes)
+        # SwinTransformer.forward_task_features() applies layers_task_cls_head internally.
+        x_cls = torch.cat(x_cls_list, dim=0)  # (B*T, num_classes) — already logits
+
         # Process segmentation output (B*T, num_classes, H, W) -> (B, T, 1, H, W)
         # Full autograd path — segmentation gradients update the full backbone
         if x_seg.size(1) == 2:
@@ -131,26 +133,16 @@ class UniversalNet(nn.Module):
         else:
             seg_out = x_seg.view(B, T, 1, H, W)
 
-        # ------------------------------------------------------------------ #
-        # STOP-GRADIENT: classification features detached from backbone       #
-        # This is the critical fix for the 5000:1 gradient imbalance.        #
-        # The cls head trains on fixed backbone features without pulling      #
-        # the backbone away from its segmentation-specialised representation. #
-        # ------------------------------------------------------------------ #
-        x_cls_detached = x_cls.detach()  # No gradient flows back to backbone
+        # x_cls is already final logits (B*T, num_classes) from SwinTransformer's head.
+        # Reshape: (B*T, num_classes) -> (B, T, num_classes)
+        x_cls_temporal = x_cls.view(B, T, -1)
 
-        # Reshape: (B*T, embed_dim) -> (B, T, embed_dim)
-        x_cls_temporal = x_cls_detached.view(B, T, -1)
-
-        # Use middle frame for classification instead of mean-pooling.
-        # For CEUS videos: contrast agent peaks at the middle frame.
-        # For single-frame images: T=1 so mid_frame=0 always — no difference.
+        # Middle-frame selection: for CEUS videos the central frame shows
+        # peak contrast enhancement (most diagnostically informative).
+        # For single-frame images T=1 → mid_frame=0, no difference.
         mid_frame = T // 2
-        cls_features = x_cls_temporal[:, mid_frame, :]  # (B, embed_dim)
+        cls_out = x_cls_temporal[:, mid_frame, :]  # (B, num_classes)
 
-        # OmniVisionTransformer wraps SwinTransformer as .swin → cls head lives there
-        cls_out = self.net.swin.layers_task_cls_head[0](cls_features)  # (B, num_classes)
-            
         return cls_out, seg_out
 
 
