@@ -148,7 +148,8 @@ class UniversalNet(nn.Module):
         mid_frame = T // 2
         cls_features = x_cls_temporal[:, mid_frame, :]  # (B, embed_dim)
 
-        cls_out = self.net.layers_task_cls_head[0](cls_features)  # (B, num_classes)
+        # OmniVisionTransformer wraps SwinTransformer as .swin → cls head lives there
+        cls_out = self.net.swin.layers_task_cls_head[0](cls_features)  # (B, num_classes)
             
         return cls_out, seg_out
 

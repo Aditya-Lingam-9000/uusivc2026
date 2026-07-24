@@ -240,8 +240,10 @@ def train():
     base_lr = 3e-4
 
     # Identify cls-head parameters: only the linear head in layers_task_cls_head
+    # OmniVisionTransformer wraps SwinTransformer as self.swin, so path is:
+    # actual_model.net (OmniVisionTransformer) -> .swin (SwinTransformer) -> .layers_task_cls_head
     actual_model = model.module if hasattr(model, 'module') else model
-    cls_head_params  = list(actual_model.net.layers_task_cls_head.parameters())
+    cls_head_params  = list(actual_model.net.swin.layers_task_cls_head.parameters())
     cls_head_ids     = {id(p) for p in cls_head_params}
     other_params     = [p for p in list(model.parameters()) + list(criterion.parameters())
                         if id(p) not in cls_head_ids]
