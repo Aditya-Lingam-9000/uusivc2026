@@ -6,6 +6,12 @@ from PIL import Image
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
+# ── Resolution control ────────────────────────────────────────────────────────
+# Set UUSIVC_IMG_SIZE=320 in your Kaggle notebook before running to switch to
+# higher-resolution training (better for small structures like thyroid nodules).
+# Default remains 224 to match original Swin-Tiny window size.
+IMG_SIZE = int(os.environ.get('UUSIVC_IMG_SIZE', '224'))
+
 # Define mappings from organ names to indices for Prompt embedding
 # Define prompt dictionaries based on hosters' official specification
 POSITION_PROMPT_ONE_HOT = {
@@ -120,16 +126,16 @@ class UniversalDataset(Dataset):
                 
             x = torch.from_numpy(video_data).float() / 255.0
             
-            # Ensure spatial dimensions match native Swin (224x224)
-            if x.shape[2] != 224 or x.shape[3] != 224:
-                x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+            # Ensure spatial dimensions match configured resolution
+            if x.shape[2] != IMG_SIZE or x.shape[3] != IMG_SIZE:
+                x = F.interpolate(x, size=(IMG_SIZE, IMG_SIZE), mode='bilinear', align_corners=False)
         else:
             # Image inputs are stored as .jpg or .png
             img = Image.open(input_path).convert('RGB')
-            # Resize for native Swin window attention (224x224)
-            img = img.resize((224, 224)) 
+            # Resize to configured resolution (default 224, or UUSIVC_IMG_SIZE)
+            img = img.resize((IMG_SIZE, IMG_SIZE))
             x = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
-            x = x.unsqueeze(0) # (1, C, H, W) to treat as a 1-frame video
+            x = x.unsqueeze(0)  # (1, C, H, W) to treat as a 1-frame video
 
         # Load Targets
         cls_target = torch.tensor([-1], dtype=torch.long)
@@ -159,8 +165,8 @@ class UniversalDataset(Dataset):
                             if idx < T:
                                 mask_data[idx, 0] = v
                         seg_target = torch.from_numpy(mask_data).float() / 255.0
-                        if seg_target.shape[2] != 224 or seg_target.shape[3] != 224:
-                            seg_target = F.interpolate(seg_target, size=(224, 224), mode='nearest')
+                        if seg_target.shape[2] != IMG_SIZE or seg_target.shape[3] != IMG_SIZE:
+                            seg_target = F.interpolate(seg_target, size=(IMG_SIZE, IMG_SIZE), mode='nearest')
                     else:
                         mask_data = npz_data['mask']
                         if len(mask_data.shape) == 3: # (T, H, W)
@@ -170,17 +176,17 @@ class UniversalDataset(Dataset):
                             mask_data = np.expand_dims(mask_data, axis=0)
                             mask_data = np.repeat(mask_data, x.shape[0], axis=0)
                         seg_target = torch.from_numpy(mask_data).float() / 255.0
-                        if seg_target.shape[2] != 224 or seg_target.shape[3] != 224:
-                            seg_target = F.interpolate(seg_target, size=(224, 224), mode='nearest')
+                        if seg_target.shape[2] != IMG_SIZE or seg_target.shape[3] != IMG_SIZE:
+                            seg_target = F.interpolate(seg_target, size=(IMG_SIZE, IMG_SIZE), mode='nearest')
                 else:
                     mask = Image.open(target_path).convert('L')
-                    mask = mask.resize((224, 224))
+                    mask = mask.resize((IMG_SIZE, IMG_SIZE))
                     seg_target = torch.from_numpy(np.array(mask)).unsqueeze(0).float() / 255.0
-                    seg_target = seg_target.unsqueeze(0) # (1, 1, H, W)
+                    seg_target = seg_target.unsqueeze(0)  # (1, 1, H, W)
 
         # Ensure single channel targets are padded to full shape
         if seg_target.numel() == 0:
-            seg_target = torch.full((x.shape[0], 1, x.shape[2], x.shape[3]), -1.0)
+            seg_target = torch.full((x.shape[0], 1, IMG_SIZE, IMG_SIZE), -1.0)
             
         # Temporal Subsampling for Videos (Prevents GPU VRAM OOM on long sequences)
         max_frames = 16
@@ -245,7 +251,8 @@ class UniversalDataset(Dataset):
             'is_video': is_video,
             'task': TASK_MAPPING.get(task, 0),
             'cls_target': cls_target.squeeze(),
-            'seg_target': seg_target
+            'seg_target': seg_target,
+            'organ_name': organ_name  # passed to loss for per-task pos_weight
         }
 
 
@@ -311,7 +318,7 @@ def pad_collate(batch):
         if has_seg:
             if st.numel() == 0:
                 # Dummy target for classification samples (-1.0 tells the loss function to ignore it)
-                st = torch.full((max_t, 1, 224, 224), -1.0, dtype=torch.float32)
+                st = torch.full((max_t, 1, IMG_SIZE, IMG_SIZE), -1.0, dtype=torch.float32)
             elif st.size(0) < max_t:
                 padding = torch.full((max_t - st.size(0), st.size(1), st.size(2), st.size(3)), -1.0, dtype=st.dtype)
                 st = torch.cat([st, padding], dim=0)
@@ -328,6 +335,7 @@ def pad_collate(batch):
         'is_video': torch.tensor([item['is_video'] for item in batch], dtype=torch.bool),
         'task': torch.tensor([item['task'] for item in batch], dtype=torch.long),
         'cls_target': torch.stack([item['cls_target'] for item in batch], dim=0),
-        'seg_target': torch.stack(seg_targets, dim=0) if has_seg else torch.empty(0)
+        'seg_target': torch.stack(seg_targets, dim=0) if has_seg else torch.empty(0),
+        'organ_name': [item['organ_name'] for item in batch]  # list of strings
     }
 

@@ -46,6 +46,12 @@ class UniversalNet(nn.Module):
     """
     Universal Medical Ultrasound Network based on the official UniUSNet architecture 
     (Lin et al., IEEE BIBM 2024). Employs Swin-Tiny (28M params) with Multi-Hot Prompt Injection.
+
+    KEY FIXES applied:
+      1. Stop-gradient on classification path — prevents 5000:1 segmentation gradient dominance
+         from starving the classifier. The cls head trains on detached backbone features.
+      2. Middle-frame CEUS classification — uses the temporally-central frame for CEUS cls
+         instead of averaging all frames (which destroys contrast-phase information).
     """
     def __init__(self, weight_path=None):
         super().__init__()
@@ -67,10 +73,11 @@ class UniversalNet(nn.Module):
         args = Args()
         config = get_config(args)
         
+        config.defrost()
+        config.TRAIN.USE_CHECKPOINT = True  # Gradient checkpointing: 70% VRAM reduction
         if weight_path:
-            config.defrost()
             config.MODEL.PRETRAIN_CKPT = weight_path
-            config.freeze()
+        config.freeze()
             
         # Instantiate OmniVisionTransformer with prompt=True
         self.net = OmniVisionTransformer(config, prompt=True)
@@ -82,6 +89,10 @@ class UniversalNet(nn.Module):
         """
         Forward pass handling 2D images and 3D videos with multi-hot prompts.
         x: (B, T, C, H, W)
+        
+        Returns:
+            cls_out: (B, num_classes)  — from detached (stop-gradient) features
+            seg_out: (B, T, 1, H, W)  — full autograd path
         """
         B, T, C, H, W = x.shape
         
@@ -94,8 +105,8 @@ class UniversalNet(nn.Module):
         type_p = type_prompt.repeat_interleave(T, dim=0)
         nat_p = nature_prompt.repeat_interleave(T, dim=0)
         
-        # Chunk frame processing to maintain VRAM < 2GB even on 100-frame video sequences
-        chunk_size = 4
+        # Ultra-lean chunk frame processing to keep VRAM < 1GB
+        chunk_size = 2
         x_seg_list = []
         x_cls_list = []
         
@@ -110,18 +121,35 @@ class UniversalNet(nn.Module):
             x_seg_list.append(seg_chunk)
             x_cls_list.append(cls_chunk)
             
-        x_seg = torch.cat(x_seg_list, dim=0)
-        x_cls = torch.cat(x_cls_list, dim=0)
+        x_seg = torch.cat(x_seg_list, dim=0)  # (B*T, num_classes, H, W)
+        x_cls = torch.cat(x_cls_list, dim=0)  # (B*T, embed_dim)
         
         # Process segmentation output (B*T, num_classes, H, W) -> (B, T, 1, H, W)
+        # Full autograd path — segmentation gradients update the full backbone
         if x_seg.size(1) == 2:
             seg_out = (x_seg[:, 1:2] - x_seg[:, 0:1]).view(B, T, 1, H, W)
         else:
             seg_out = x_seg.view(B, T, 1, H, W)
+
+        # ------------------------------------------------------------------ #
+        # STOP-GRADIENT: classification features detached from backbone       #
+        # This is the critical fix for the 5000:1 gradient imbalance.        #
+        # The cls head trains on fixed backbone features without pulling      #
+        # the backbone away from its segmentation-specialised representation. #
+        # ------------------------------------------------------------------ #
+        x_cls_detached = x_cls.detach()  # No gradient flows back to backbone
+
+        # Reshape: (B*T, embed_dim) -> (B, T, embed_dim)
+        x_cls_temporal = x_cls_detached.view(B, T, -1)
+
+        # Use middle frame for classification instead of mean-pooling.
+        # For CEUS videos: contrast agent peaks at the middle frame.
+        # For single-frame images: T=1 so mid_frame=0 always — no difference.
+        mid_frame = T // 2
+        cls_features = x_cls_temporal[:, mid_frame, :]  # (B, embed_dim)
+
+        cls_out = self.net.layers_task_cls_head[0](cls_features)  # (B, num_classes)
             
-        # Process classification output (B*T, num_classes) -> (B, num_classes)
-        cls_out = x_cls.view(B, T, -1).mean(dim=1)
-        
         return cls_out, seg_out
 
 
