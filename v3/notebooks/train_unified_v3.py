@@ -409,14 +409,14 @@ def train():
                 torch.cuda.empty_cache()
 
             # Step-level logging every 100 steps
-            if (step + 1) % 100 == 0 or (step + 1) == total_steps_per_epoch:
+            if (step + 1) % 100 == 0 or (step + 1) == steps_per_epoch:
                 window = 100 if (step + 1) % 100 == 0 else (step + 1) % 100
                 avg_loss    = running_loss / max(window, 1)
                 running_loss = 0.0
 
                 elapsed     = time.time() - epoch_start
                 time_per_step = elapsed / (step + 1)
-                eta_epoch   = time_per_step * (total_steps_per_epoch - step - 1)
+                eta_epoch   = time_per_step * (steps_per_epoch - step - 1)
 
                 vram_used  = torch.cuda.memory_allocated(device) / (1024 ** 3)
                 vram_res   = torch.cuda.memory_reserved(device) / (1024 ** 3)
@@ -434,7 +434,7 @@ def train():
         total_eta = epoch_duration * remaining_epochs
 
         print(f"\n[EPOCH {epoch+1} DONE] "
-              f"Avg Loss: {epoch_loss / max(total_steps_per_epoch, 1):.4f} "
+              f"Avg Loss: {epoch_loss / max(steps_per_epoch, 1):.4f} "
               f"| Duration: {epoch_duration:.1f}m "
               f"| ETA total: {total_eta/60:.1f} hrs")
 
